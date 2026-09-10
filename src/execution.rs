@@ -15,7 +15,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use turso_sdk_kit::rsapi::TursoDatabase;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub timeout: Duration,
     pub max_rows: usize,
@@ -30,6 +30,13 @@ pub struct Executor {
 enum Database {
     Turso(Arc<TursoDatabase>),
     Postgres(Arc<tokio_postgres::Config>),
+}
+
+// Drop database ownership before announcing that request cleanup has completed,
+// including failures during input validation.
+struct TrackedDatabase<L> {
+    database: Option<Database>,
+    _lifetime: L,
 }
 
 impl Executor {
@@ -53,6 +60,19 @@ impl Executor {
         input: Input,
         limits: Limits,
     ) -> Result<Vec<u8>, SqlrestError> {
+        self.clone()
+            .execute_tracked(endpoint, input, limits, ())
+            .await
+    }
+
+    /// The lifetime token belongs to the cleanup supervisor, not the caller.
+    pub(crate) async fn execute_tracked(
+        self,
+        endpoint: Arc<Endpoint>,
+        input: Input,
+        limits: Limits,
+        lifetime: impl Send + 'static,
+    ) -> Result<Vec<u8>, SqlrestError> {
         let backend = match self.database {
             Database::Turso(_) => Backend::Turso,
             Database::Postgres(_) => Backend::Postgres,
@@ -70,9 +90,13 @@ impl Executor {
             cancel: CancellationToken::new(),
         };
         let _cancel_on_drop = CancelOnDrop(control.cancel.clone());
-        let database = self.database.clone();
+        let database = self.database;
         // The worker owns cleanup even if the caller disconnects/drops this future.
         tokio::spawn(async move {
+            let mut tracked = TrackedDatabase {
+                database: Some(database),
+                _lifetime: lifetime,
+            };
             let checking_endpoint = endpoint.clone();
             let checking_control = control.clone();
             let validation = tokio::task::spawn_blocking(move || {
@@ -91,7 +115,7 @@ impl Executor {
                     })?
                 })
                 .await?;
-            match database {
+            match tracked.database.take().unwrap() {
                 Database::Turso(database) => {
                     crate::turso_driver::run_request(
                         database,

@@ -145,8 +145,15 @@ pub(crate) async fn run_request(
     let worker_control = control.clone();
     let started = Arc::new(Mutex::new(false));
     let worker_started = started.clone();
+    // A cancelled queued blocking closure can outlive this future. It must not
+    // keep an open database alive after the registry releases its file claim.
+    let worker_database = Arc::downgrade(&database);
     let mut worker = tokio::task::spawn_blocking(move || {
         *worker_started.lock().unwrap() = true;
+        worker_control.check()?;
+        let database = worker_database
+            .upgrade()
+            .ok_or_else(database_error_generic)?;
         request(
             &database,
             &endpoint,
@@ -176,6 +183,9 @@ pub(crate) async fn run_request(
                 let error = control.check().err().unwrap_or_else(timeout);
                 control.cancel.cancel();
                 watchdog.abort();
+                // Do not retain a connection in the cancelled watchdog after
+                // the request lifetime token is released.
+                // This branch has no connection yet, so no await is needed.
                 return Err(error);
             }
         }
@@ -189,6 +199,7 @@ pub(crate) async fn run_request(
         }
     });
     watchdog.abort();
+    let _ = watchdog.await;
     result?
 }
 
@@ -356,6 +367,11 @@ fn cell(value: Value) -> Result<Cell, SqlrestError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{loader::Snapshot, sql::Backend};
+    use std::collections::BTreeMap;
+    use tokio_util::sync::CancellationToken;
+
     #[test]
     fn real_driver_error_retains_private_diagnostics() {
         let directory = tempfile::tempdir().unwrap();
@@ -380,5 +396,65 @@ mod tests {
                 .contains("private_missing_column")
         );
         connection.close().unwrap();
+    }
+
+    #[test]
+    fn cancelled_queued_worker_does_not_retain_or_reopen_database() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("queue.db");
+            let database = open(&path).unwrap();
+            let weak = Arc::downgrade(&database);
+            let snapshot = Snapshot::from_files(
+                BTreeMap::from([(
+                    "post.sql".into(),
+                    "CREATE TABLE must_not_exist(id INTEGER)".into(),
+                )]),
+                Backend::Turso,
+            )
+            .unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            started_rx.await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_millis(500),
+                run_request(
+                    database.clone(),
+                    snapshot.endpoints()[0].clone(),
+                    vec![vec![]],
+                    Control {
+                        deadline: Instant::now() + Duration::from_millis(30),
+                        cancel: CancellationToken::new(),
+                    },
+                    0,
+                ),
+            )
+            .await;
+            // Capture ownership before releasing the occupied worker.
+            let remaining_owners = Arc::strong_count(&database);
+            drop(database);
+            let released = weak.upgrade().is_none();
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            assert_eq!(result.unwrap().unwrap_err().code, "execution_timeout");
+            assert_eq!(remaining_owners, 1);
+            assert!(released, "queued closure must not retain the database");
+            let reopened = open(&path).unwrap();
+            let connection = reopened.connect().unwrap();
+            assert!(
+                connection
+                    .prepare_single("SELECT * FROM must_not_exist")
+                    .is_err()
+            );
+        });
     }
 }

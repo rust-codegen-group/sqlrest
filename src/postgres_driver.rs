@@ -30,11 +30,25 @@ pub(crate) async fn run_request(
     let (client, connection) = control
         .wait(async { config.connect(NoTls).await.map_err(database_error) })
         .await?;
-    let _connection_task = ConnectionTask(tokio::spawn(async move {
+    let mut connection_task = ConnectionTask(tokio::spawn(async move {
         if let Err(error) = connection.await {
             let _ = database_error(error);
         }
     }));
+    let result = execute_transaction(&client, endpoint, prepared, control, max_rows).await;
+    drop(client);
+    connection_task.0.abort();
+    let _ = (&mut connection_task.0).await;
+    result
+}
+
+async fn execute_transaction(
+    client: &Client,
+    endpoint: Arc<Endpoint>,
+    prepared: Prepared,
+    control: Control,
+    max_rows: usize,
+) -> Result<Vec<u8>, SqlrestError> {
     let result = control
         .wait(async {
             let begin = if matches!(endpoint.method(), "get" | "head") {
@@ -48,7 +62,7 @@ pub(crate) async fn run_request(
             for (index, (statement, values)) in
                 endpoint.statements().iter().zip(prepared).enumerate()
             {
-                set_deadline(&client, &control).await?;
+                set_deadline(client, &control).await?;
                 let types: Vec<_> = values.iter().map(|v| parameter_type(&v.ty)).collect();
                 let params: Vec<_> = values.into_iter().map(bind).collect();
                 let statement = client
@@ -76,7 +90,7 @@ pub(crate) async fn run_request(
                             .check_columns(&final_names)?;
                     }
                 }
-                set_deadline(&client, &control).await?;
+                set_deadline(client, &control).await?;
                 let stream = client
                     .query_raw(
                         &statement,
@@ -110,16 +124,16 @@ pub(crate) async fn run_request(
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(error) => {
-            cleanup(&client).await?;
+            cleanup(client).await?;
             return Err(error);
         }
     };
     if let Err(error) = control.check() {
-        cleanup(&client).await?;
+        cleanup(client).await?;
         return Err(error);
     }
-    if let Err(error) = control.wait(set_deadline(&client, &control)).await {
-        cleanup(&client).await?;
+    if let Err(error) = control.wait(set_deadline(client, &control)).await {
+        cleanup(client).await?;
         return Err(error);
     }
     // Past this point transport failure may mean the server committed but its
@@ -132,7 +146,7 @@ pub(crate) async fn run_request(
         })
         .await
     {
-        let _ = cleanup(&client).await;
+        let _ = cleanup(client).await;
         return Err(if attempted {
             execution::commit_unknown().with_diagnostic("postgres", error)
         } else {
