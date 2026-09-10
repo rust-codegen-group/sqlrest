@@ -23,6 +23,8 @@ turso_core = { version = "=0.8.0-pre.10", default-features = false }
 url = "2"
 percent-encoding = "2"
 heck = "0.5"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3"

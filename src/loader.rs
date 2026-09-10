@@ -18,6 +18,7 @@ use std::{
 const METHODS: &[&str] = &["get", "head", "post", "put", "patch", "delete", "options"];
 
 pub struct Endpoint {
+    backend: Backend,
     method: String,
     path: String,
     segments: Vec<Segment>,
@@ -34,6 +35,10 @@ enum Segment {
 }
 
 impl Endpoint {
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
     pub fn method(&self) -> &str {
         &self.method
     }
@@ -213,6 +218,7 @@ impl Snapshot {
                 }
             }
             endpoints.push(Arc::new(Endpoint {
+                backend,
                 method: method.into(),
                 path,
                 segments,

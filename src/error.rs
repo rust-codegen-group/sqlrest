@@ -9,6 +9,8 @@ pub struct SqlrestError {
     pub parameter: Option<String>,
     #[serde(skip)]
     pub status: u16,
+    #[serde(skip)]
+    diagnostic: Option<std::sync::Arc<str>>,
 }
 
 impl SqlrestError {
@@ -18,7 +20,30 @@ impl SqlrestError {
             code: code.into(),
             message: message.into(),
             parameter: None,
+            diagnostic: None,
         }
+    }
+
+    /// Private driver details for trusted runtime diagnostics only.
+    /// Never include this value (or this error's Debug output) in a data response.
+    pub fn diagnostic(&self) -> Option<&str> {
+        self.diagnostic.as_deref()
+    }
+
+    pub(crate) fn with_diagnostic(mut self, backend: &str, detail: impl std::fmt::Debug) -> Self {
+        use std::io::Write;
+        let diagnostic = format!("{backend}: {detail:?}");
+        // Record at the conversion boundary: cancellation/rollback may replace
+        // the returned error later. JSON escaping prevents multiline log injection.
+        // Logging failure must never panic or change transaction outcomes.
+        let record = serde_json::json!({
+            "event": "sqlrest.database_error",
+            "code": self.code,
+            "diagnostic": diagnostic,
+        });
+        let _ = writeln!(std::io::stderr().lock(), "{record}");
+        self.diagnostic = Some(diagnostic.into());
+        self
     }
 
     pub fn definition(message: impl Into<String>) -> Self {
@@ -33,5 +58,29 @@ impl SqlrestError {
 
     pub fn contract(message: impl Into<String>) -> Self {
         Self::new(500, "response_contract_mismatch", message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_diagnostics_never_enter_public_serialization() {
+        let error = SqlrestError::new(500, "database_error", "Database operation failed")
+            .with_diagnostic("postgres", "private_secret\nsecond line");
+        assert!(error.diagnostic().unwrap().contains("private_secret"));
+        assert!(
+            error
+                .clone()
+                .diagnostic()
+                .unwrap()
+                .contains("private_secret")
+        );
+        assert!(!error.to_string().contains("private_secret"));
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains("private_secret"));
+        assert!(!public.contains("diagnostic"));
+        assert!(format!("{error:?}").contains("private_secret"));
     }
 }
