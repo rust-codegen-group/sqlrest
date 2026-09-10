@@ -192,6 +192,25 @@ pub struct Input {
 
 impl Input {
     pub fn from_http(query: &str, body: &[u8]) -> Result<Self, SqlrestError> {
+        // Reject malformed percent encoding before the form parser can replace
+        // invalid UTF-8 with U+FFFD or preserve an invalid '%' literally.
+        let bytes = query.as_bytes();
+        for (i, byte) in bytes.iter().enumerate() {
+            if *byte == b'%'
+                && (i + 2 >= bytes.len()
+                    || !bytes[i + 1].is_ascii_hexdigit()
+                    || !bytes[i + 2].is_ascii_hexdigit())
+            {
+                return Err(SqlrestError::new(
+                    400,
+                    "invalid_query",
+                    "Invalid query percent encoding",
+                ));
+            }
+        }
+        percent_encoding::percent_decode_str(query)
+            .decode_utf8()
+            .map_err(|_| SqlrestError::new(400, "invalid_query", "Query is not valid UTF-8"))?;
         let mut fields = BTreeMap::new();
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             if fields

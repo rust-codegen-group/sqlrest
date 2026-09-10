@@ -1,6 +1,7 @@
-use crate::SqlrestError;
+use crate::{SqlrestError, schema};
+use heck::ToUpperCamelCase;
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Driver values before schema-directed decoding. Binary data must be explicitly
 /// encoded by SQL; text is never guessed to be JSON without a structural schema.
@@ -17,42 +18,123 @@ pub enum Cell {
 pub struct Contract {
     schema: Value,
     validator: jsonschema::Validator,
+    fields: BTreeMap<String, Decode>,
+}
+
+#[derive(Clone, Copy)]
+struct Decode {
+    json: bool,
+    boolean: bool,
 }
 
 impl Contract {
     pub fn from_yaml(source: &str) -> Result<Self, SqlrestError> {
-        let schema = serde_norway::from_str(source)
+        let yaml: serde_norway::Value = serde_norway::from_str(source)
             .map_err(|e| SqlrestError::definition(format!("Invalid response schema: {e}")))?;
+        let schema = serde_json::to_value(yaml).map_err(|e| {
+            SqlrestError::definition(format!(
+                "Response schema must use JSON-compatible values: {e}"
+            ))
+        })?;
         Self::new(schema)
     }
 
     pub fn new(schema: Value) -> Result<Self, SqlrestError> {
-        check_references(&schema)?;
-        let root = resolve(&schema, &schema)?;
-        if root.get("type").and_then(Value::as_str) != Some("object")
-            || !root.get("properties").is_some_and(Value::is_object)
-        {
-            return Err(SqlrestError::definition(
-                "Record schema needs explicit object properties",
-            ));
-        }
+        let schema = schema::normalize(schema)?;
         let validator = jsonschema::options()
             .with_draft(jsonschema::Draft::Draft202012)
             .build(&schema)
             .map_err(|e| SqlrestError::definition(format!("Invalid response schema: {e}")))?;
-        Ok(Self { schema, validator })
+        let mut fields = BTreeMap::new();
+        for (name, definition) in schema::properties(&schema)? {
+            let types = schema::types(&schema, &definition, &mut BTreeSet::new())?;
+            let structural = types & (schema::OBJECT | schema::ARRAY) != 0;
+            let boolean = types & schema::BOOLEAN != 0;
+            if structural && types & schema::STRING != 0 || boolean && types & schema::NUMBER != 0 {
+                return Err(SqlrestError::definition(format!(
+                    "Ambiguous database decoding for field {name}; string/JSON and number/boolean unions require an unambiguous contract"
+                )));
+            }
+            fields.insert(
+                name,
+                Decode {
+                    json: structural,
+                    boolean,
+                },
+            );
+        }
+        Ok(Self {
+            schema,
+            validator,
+            fields,
+        })
     }
 
     pub fn schema(&self) -> &Value {
         &self.schema
     }
 
+    pub fn relocated(&self, base: &str) -> Result<Value, SqlrestError> {
+        let mut schema = self.schema.clone();
+        schema::walk(&mut schema, "", &mut |map, _| {
+            schema::rewrite_refs(map, &mut |reference| {
+                Ok(format!("{base}{}", &reference[1..]))
+            })
+        })?;
+        Ok(schema)
+    }
+
+    /// Lift referenced nodes to named components without expanding recursive
+    /// graphs. This also works for consumers that only resolve named models.
+    pub fn openapi_components(&self, name: &str) -> Result<BTreeMap<String, Value>, SqlrestError> {
+        let mut targets = BTreeSet::from(["#".to_owned()]);
+        let mut schema = self.schema.clone();
+        schema::walk(&mut schema, "", &mut |map, _| {
+            schema::rewrite_refs(map, &mut |reference| {
+                targets.insert(reference.to_owned());
+                Ok(reference.to_owned())
+            })
+        })?;
+        let mut names = BTreeMap::new();
+        let mut used = BTreeSet::new();
+        for target in &targets {
+            let pointer = percent_encoding::percent_decode_str(&target[1..])
+                .decode_utf8()
+                .map_err(|_| SqlrestError::definition("Invalid reference encoding"))?;
+            let suffix = pointer.to_upper_camel_case();
+            let generated = format!("{name}{suffix}");
+            if !generated.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return Err(SqlrestError::definition(
+                    "Referenced schema nodes need names that normalize to ASCII component identifiers",
+                ));
+            }
+            if !used.insert(generated.clone()) {
+                return Err(SqlrestError::definition(format!(
+                    "Generated schema name collision: {generated}"
+                )));
+            }
+            names.insert(target.clone(), generated);
+        }
+        let mut components = BTreeMap::new();
+        for target in targets {
+            let pointer = percent_encoding::percent_decode_str(&target[1..])
+                .decode_utf8()
+                .map_err(|_| SqlrestError::definition("Invalid reference encoding"))?;
+            let mut node = self.schema.pointer(&pointer).unwrap().clone();
+            schema::walk(&mut node, "", &mut |map, _| {
+                schema::rewrite_refs(map, &mut |reference| {
+                    let generated = &names[reference];
+                    Ok(format!("#/components/schemas/{generated}"))
+                })
+            })?;
+            components.insert(names[&target].clone(), node);
+        }
+        Ok(components)
+    }
+
     pub fn check_columns(&self, names: &[String]) -> Result<(), SqlrestError> {
-        let properties = resolve(&self.schema, &self.schema)?["properties"]
-            .as_object()
-            .unwrap();
         let unique: BTreeSet<_> = names.iter().collect();
-        if unique.len() != names.len() || unique != properties.keys().collect() {
+        if unique.len() != names.len() || unique != self.fields.keys().collect() {
             return Err(SqlrestError::contract(
                 "Result columns must exactly match record properties",
             ));
@@ -70,14 +152,10 @@ impl Contract {
         if cells.len() != names.len() {
             return Err(SqlrestError::contract("Invalid result width"));
         }
-        let properties = resolve(&self.schema, &self.schema)?["properties"]
-            .as_object()
-            .unwrap();
         let mut record = Map::new();
         for (name, cell) in names.iter().zip(cells) {
-            let field = resolve(&self.schema, &properties[name])?;
-            let structural = has_type(field, "object") || has_type(field, "array");
-            let boolean = has_type(field, "boolean");
+            let structural = self.fields[name].json;
+            let boolean = self.fields[name].boolean;
             let value = match cell {
                 Cell::Null => Value::Null,
                 Cell::Boolean(v) => Value::Bool(v),
@@ -105,65 +183,6 @@ impl Contract {
         }
         Ok(record)
     }
-}
-
-fn has_type(schema: &Value, expected: &str) -> bool {
-    match schema.get("type") {
-        Some(Value::String(s)) => s == expected,
-        Some(Value::Array(items)) => items.iter().any(|v| v.as_str() == Some(expected)),
-        _ => false,
-    }
-}
-
-fn resolve<'a>(root: &'a Value, mut node: &'a Value) -> Result<&'a Value, SqlrestError> {
-    let mut seen = BTreeSet::new();
-    while let Some(reference) = node.get("$ref").and_then(Value::as_str) {
-        if !seen.insert(reference) {
-            return Err(SqlrestError::definition(
-                "Cyclic schema alias without a concrete type",
-            ));
-        }
-        let pointer = reference
-            .strip_prefix('#')
-            .ok_or_else(|| SqlrestError::definition("External schema reference"))?;
-        node = root
-            .pointer(pointer)
-            .ok_or_else(|| SqlrestError::definition("Unresolved local schema reference"))?;
-    }
-    Ok(node)
-}
-
-fn check_references(value: &Value) -> Result<(), SqlrestError> {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                // Resource identifiers change reference scope; do not let the
-                // validator retrieve resources outside this self-contained file.
-                if key == "$id" || key == "$dynamicRef" {
-                    return Err(SqlrestError::definition(
-                        "Schema resource IDs and dynamic references are not supported",
-                    ));
-                }
-                if key == "$ref"
-                    && !value
-                        .as_str()
-                        .is_some_and(|s| s == "#" || s.starts_with("#/"))
-                {
-                    return Err(SqlrestError::definition(
-                        "Only local JSON Pointer schema references are supported",
-                    ));
-                }
-                check_references(value)?;
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                check_references(value)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 #[cfg(test)]

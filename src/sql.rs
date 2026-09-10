@@ -3,10 +3,34 @@ use crate::{
     params::{Parameter, validate_parameters},
 };
 use sqlparser::{
+    ast::{Expr, Value as SqlValue, Visit, Visitor},
     dialect::{Dialect, PostgreSqlDialect, SQLiteDialect},
     parser::Parser,
     tokenizer::{Token, Tokenizer},
 };
+use std::ops::ControlFlow;
+
+struct ParameterVisitor {
+    count: usize,
+}
+
+impl Visitor for ParameterVisitor {
+    type Break = SqlrestError;
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<SqlrestError> {
+        if let Expr::Value(value) = expr
+            && let SqlValue::Placeholder(name) = &value.value
+        {
+            if !name.starts_with("$sqlrest_internal_") {
+                return ControlFlow::Break(SqlrestError::definition(
+                    "Native SQL parameters cannot be mixed with typed references",
+                ));
+            }
+            self.count += 1;
+        }
+        ControlFlow::Continue(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -27,6 +51,7 @@ impl Backend {
 pub struct Statement {
     pub sql: String,
     pub parameters: Vec<Parameter>,
+    pub returns_rows: bool,
 }
 
 pub fn compile(source: &str, backend: Backend) -> Result<Vec<Statement>, SqlrestError> {
@@ -168,21 +193,22 @@ pub fn compile(source: &str, backend: Backend) -> Result<Vec<Statement>, Sqlrest
                     .parse_statements()
                     .map_err(|e| SqlrestError::definition(e.to_string()))?;
                 if !ast.is_empty() {
-                    // Endpoints are data operations, not connection/transaction administration.
-                    if ast.iter().any(|s| {
-                        !matches!(
-                            s,
-                            sqlparser::ast::Statement::Query(_)
-                                | sqlparser::ast::Statement::Insert(_)
-                                | sqlparser::ast::Statement::Update { .. }
-                                | sqlparser::ast::Statement::Delete(_)
-                        )
-                    }) {
+                    let mut visitor = ParameterVisitor { count: 0 };
+                    if let ControlFlow::Break(error) = ast.visit(&mut visitor) {
+                        return Err(error);
+                    }
+                    if visitor.count != bound.len() {
                         return Err(SqlrestError::definition(
-                            "endpoint SQL must be SELECT, INSERT, UPDATE or DELETE; use migrations for DDL",
+                            "Parameters may only bind SQL values, not identifiers",
+                        ));
+                    }
+                    if ast.iter().any(|s| !transaction_statement(s)) {
+                        return Err(SqlrestError::definition(
+                            "SQL statement is unsupported inside a managed request transaction",
                         ));
                     }
                     output.push(Statement {
+                        returns_rows: returns_rows(&ast[0]),
                         sql: original,
                         parameters: std::mem::take(&mut bound),
                     });
@@ -229,7 +255,44 @@ pub fn compile(source: &str, backend: Backend) -> Result<Vec<Statement>, Sqlrest
     if output.is_empty() {
         return Err(SqlrestError::definition("empty endpoint"));
     }
+    if output.iter().map(|s| s.parameters.len()).sum::<usize>() != parameters.len() {
+        return Err(SqlrestError::definition(
+            "Typed references must be standalone SQL values",
+        ));
+    }
     Ok(output)
+}
+
+fn transaction_statement(statement: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::{ObjectType, Statement as S};
+    match statement {
+        S::Query(_)
+        | S::Insert(_)
+        | S::Update { .. }
+        | S::Delete(_)
+        | S::CreateTable(_)
+        | S::CreateView { .. }
+        | S::AlterTable { .. } => true,
+        S::CreateIndex(index) => !index.concurrently,
+        S::Drop { object_type, .. } => matches!(
+            object_type,
+            ObjectType::Table | ObjectType::Index | ObjectType::View
+        ),
+        _ => false,
+    }
+}
+
+fn returns_rows(statement: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::{SetExpr, Statement as S};
+    match statement {
+        S::Query(query) => {
+            !matches!(query.body.as_ref(), SetExpr::Select(select) if select.into.is_some())
+        }
+        S::Insert(insert) => insert.returning.is_some(),
+        S::Delete(delete) => delete.returning.is_some(),
+        S::Update { returning, .. } => returning.is_some(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

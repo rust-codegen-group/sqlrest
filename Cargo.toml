@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 sha2 = "0.10"
-sqlparser = "0.59"
+sqlparser = { version = "0.59", features = ["visitor"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
@@ -21,6 +21,8 @@ turso = { version = "=0.8.0-pre.10", default-features = false }
 turso_sdk_kit = { version = "=0.8.0-pre.10", default-features = false }
 turso_core = { version = "=0.8.0-pre.10", default-features = false }
 url = "2"
+percent-encoding = "2"
+heck = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
