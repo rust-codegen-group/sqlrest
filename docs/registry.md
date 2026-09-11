@@ -72,7 +72,7 @@ server-alias deduplication or PostgreSQL advisory locks are added.
 
 ## Publication and operations
 
-`reload` and `unregister` synchronously reserve a per-database management slot,
+`reload`, `migrate` and `unregister` synchronously reserve a per-database management slot,
 return an opaque operation ID, and continue in the background. They require an
 active Tokio runtime. A conflicting operation immediately returns
 `operation_in_progress` (409), never queues. Other databases may operate
@@ -97,6 +97,7 @@ Resolved path parameters replace any caller-provided `Input.path`.
 | `registering` | 503 |
 | `unloaded` | 503 |
 | `ready` (including reload in progress) | Published snapshot |
+| `migrating` or `paused` | 503; see `migrations.md` for recovery |
 | `unregistering` | 503; admitted requests drain |
 | `unregistered` | 503 |
 
@@ -123,4 +124,5 @@ latest completed operation, not an operation history. Older results return
 registration, even if that name is later reused. Retired names have no time-based
 expiry and remain until reused or the Registry is dropped. Registry/process
 restart loses all names, snapshots and operation IDs; the runtime must re-register.
-No persistence, migration lifecycle or HTTP protocol is implemented here.
+There is no persisted registry/operation queue or HTTP protocol here.
+Forward-only migration history and recovery are described in `migrations.md`.

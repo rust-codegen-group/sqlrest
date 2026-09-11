@@ -5,6 +5,7 @@ use crate::{
     SqlrestError,
     execution::{Executor, Limits},
     loader::Snapshot,
+    migration::{AppliedMigration, Migrator, Plan},
     params::Input,
     sql::Backend,
 };
@@ -69,6 +70,8 @@ pub enum Phase {
     Registering,
     Unloaded,
     Ready,
+    Migrating,
+    Paused,
     Unregistering,
     Unregistered,
     RegistrationFailed,
@@ -82,6 +85,7 @@ pub struct OperationId(u64);
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     Reload,
+    Migrate,
     Unregister,
 }
 
@@ -99,6 +103,33 @@ pub struct Operation {
     pub kind: OperationKind,
     pub outcome: Outcome,
     pub error: Option<SqlrestError>,
+    pub migration: Option<MigrationProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReason {
+    MigrationFailed,
+    ReloadFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationStep {
+    Preflight,
+    Draining,
+    Applying,
+    Reloading,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrationProgress {
+    pub step: MigrationStep,
+    pub applied_versions: Vec<i64>,
+    pub current_version: Option<i64>,
+    pub failed_version: Option<i64>,
+    pub interfaces_reloaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +139,7 @@ pub struct Status {
     pub active_requests: usize,
     pub current_operation: Option<Operation>,
     pub last_operation: Option<Operation>,
+    pub pause_reason: Option<PauseReason>,
 }
 
 #[derive(Clone, Default)]
@@ -129,6 +161,7 @@ struct State {
     current: Option<Operation>,
     last: Option<Operation>,
     registration_error: Option<SqlrestError>,
+    pause_reason: Option<PauseReason>,
 }
 
 // Field order matters: drop the database before releasing its file claim.
@@ -193,6 +226,7 @@ impl Registry {
                         current: None,
                         last: None,
                         registration_error: None,
+                        pause_reason: None,
                     }),
                     changed: Notify::new(),
                 });
@@ -289,6 +323,7 @@ impl Registry {
                 Ok(snapshot) => {
                     old_snapshot = state.snapshot.replace(snapshot);
                     state.phase = Phase::Ready;
+                    state.pause_reason = None;
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -300,6 +335,67 @@ impl Registry {
             drop(old_snapshot);
         });
         Ok(id)
+    }
+
+    /// Preflight before pausing; accepted migrations survive caller disconnects.
+    pub fn migrate(&self, name: &str) -> Result<OperationId, SqlrestError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            SqlrestError::definition("Management operations require a Tokio runtime")
+        })?;
+        let database = self.database(name)?;
+        let id = begin(&database, OperationKind::Migrate)?;
+        runtime.spawn(async move {
+            let working = database.clone();
+            let result = tokio::spawn(async move { run_migration(&working).await })
+                .await
+                .unwrap_or_else(|_| Err(worker_failed()));
+            let mut state = database.state.lock().unwrap();
+            if result.is_err() && state.phase == Phase::Migrating {
+                state.phase = Phase::Paused;
+                state.pause_reason = Some(PauseReason::MigrationFailed);
+                let progress = state.current.as_mut().unwrap().migration.as_mut().unwrap();
+                if progress.failed_version.is_none() {
+                    progress.failed_version = progress.current_version.take();
+                }
+            }
+            finish(&mut state, result);
+            drop(state);
+            database.changed.notify_waiters();
+        });
+        Ok(id)
+    }
+
+    /// Return durable original SQL, without writing or overwriting runtime files.
+    pub async fn export_migrations(
+        &self,
+        name: &str,
+    ) -> Result<Vec<AppliedMigration>, SqlrestError> {
+        let database = self.database(name)?;
+        let (migrator, lifetime) = {
+            let mut state = database.state.lock().unwrap();
+            if !matches!(state.phase, Phase::Ready | Phase::Unloaded | Phase::Paused) {
+                return Err(unavailable());
+            }
+            let migrator = migrator(&database, &state);
+            state.active += 1;
+            (
+                migrator,
+                RequestLifetime {
+                    database: database.clone(),
+                    _snapshot: state.snapshot.clone(),
+                },
+            )
+        };
+        // Export is a read-only management task. Keep its drain lease until the
+        // executor has finished even if its caller drops this future.
+        tokio::spawn(async move {
+            let _lifetime = lifetime;
+            let result = migrator.history().await;
+            drop(migrator);
+            result
+        })
+        .await
+        .map_err(|_| worker_failed())?
     }
 
     /// Close admission immediately; completion waits for actual request cleanup.
@@ -326,6 +422,7 @@ impl Registry {
                 .map_err(|_| worker_failed());
             let mut state = database.state.lock().unwrap();
             state.phase = Phase::Unregistered;
+            state.pause_reason = None;
             finish(&mut state, result);
             drop(state);
             database.changed.notify_waiters();
@@ -380,7 +477,7 @@ impl Registry {
             state.active += 1;
             let lifetime = RequestLifetime {
                 database: database.clone(),
-                _snapshot: snapshot,
+                _snapshot: Some(snapshot),
             };
             (executor, matched, lifetime)
         };
@@ -409,7 +506,7 @@ impl Registry {
 
 struct RequestLifetime {
     database: Arc<Database>,
-    _snapshot: Arc<Snapshot>,
+    _snapshot: Option<Arc<Snapshot>>,
 }
 
 impl Drop for RequestLifetime {
@@ -435,6 +532,13 @@ fn begin(database: &Database, kind: OperationKind) -> Result<OperationId, Sqlres
             "Database configuration is not registered",
         ));
     }
+    if kind == OperationKind::Reload && state.pause_reason == Some(PauseReason::MigrationFailed) {
+        return Err(SqlrestError::new(
+            409,
+            "migration_recovery_required",
+            "Retry migrate successfully before reloading interfaces",
+        ));
+    }
     let id = NEXT_OPERATION
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .map(OperationId)
@@ -444,6 +548,13 @@ fn begin(database: &Database, kind: OperationKind) -> Result<OperationId, Sqlres
         kind,
         outcome: Outcome::Running,
         error: None,
+        migration: (kind == OperationKind::Migrate).then_some(MigrationProgress {
+            step: MigrationStep::Preflight,
+            applied_versions: Vec::new(),
+            current_version: None,
+            failed_version: None,
+            interfaces_reloaded: false,
+        }),
     });
     if kind == OperationKind::Unregister {
         state.phase = Phase::Unregistering;
@@ -488,7 +599,122 @@ fn status(state: &State) -> Status {
         active_requests: state.active,
         current_operation: state.current.clone(),
         last_operation: state.last.clone(),
+        pause_reason: state.pause_reason,
     }
+}
+
+fn migrator(database: &Database, state: &State) -> Migrator {
+    Migrator {
+        executor: state
+            .resources
+            .as_ref()
+            .expect("registered resources")
+            .executor
+            .clone(),
+        backend: database.config.backend(),
+        timeout: database.config.limits.timeout,
+    }
+}
+
+fn progress(database: &Database, update: impl FnOnce(&mut MigrationProgress)) {
+    let mut state = database.state.lock().unwrap();
+    update(state.current.as_mut().unwrap().migration.as_mut().unwrap());
+}
+
+async fn run_migration(database: &Database) -> Result<(), SqlrestError> {
+    let root = database.config.migrations.clone();
+    let backend = database.config.backend();
+    let plan = tokio::task::spawn_blocking(move || Plan::load(&root, backend))
+        .await
+        .map_err(|_| worker_failed())??;
+    let migrator = migrator(database, &database.state.lock().unwrap());
+    let history = migrator.history().await?;
+    let plan = tokio::task::spawn_blocking(move || {
+        plan.validate(&history)?;
+        Ok::<_, SqlrestError>(plan)
+    })
+    .await
+    .map_err(|_| worker_failed())??;
+    let published = {
+        let mut state = database.state.lock().unwrap();
+        let published = state.snapshot.is_some();
+        state.phase = Phase::Migrating;
+        state
+            .current
+            .as_mut()
+            .unwrap()
+            .migration
+            .as_mut()
+            .unwrap()
+            .step = MigrationStep::Draining;
+        published
+    };
+    loop {
+        let changed = database.changed.notified();
+        if database.state.lock().unwrap().active == 0 {
+            break;
+        }
+        changed.await;
+    }
+    // Recheck history after drain, but never re-read the deployed files.
+    let history = migrator.history().await?;
+    let pending = tokio::task::spawn_blocking(move || plan.into_pending(&history))
+        .await
+        .map_err(|_| worker_failed())??;
+    for file in pending {
+        let version = file.record.version;
+        progress(database, |p| {
+            p.step = MigrationStep::Applying;
+            p.current_version = Some(version);
+        });
+        if let Err(error) = migrator.apply(file).await {
+            progress(database, |p| {
+                p.failed_version = Some(version);
+                p.current_version = None;
+            });
+            return Err(error);
+        }
+        progress(database, |p| {
+            p.applied_versions.push(version);
+            p.current_version = None;
+        });
+    }
+    let snapshot = if published {
+        progress(database, |p| p.step = MigrationStep::Reloading);
+        let root = database.config.interfaces.clone();
+        match tokio::task::spawn_blocking(move || Snapshot::load(&root, backend).map(Arc::new))
+            .await
+            .unwrap_or_else(|_| Err(worker_failed()))
+        {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => {
+                let mut state = database.state.lock().unwrap();
+                state.phase = Phase::Paused;
+                state.pause_reason = Some(PauseReason::ReloadFailed);
+                return Err(SqlrestError::new(
+                    500,
+                    "migration_reload_failed",
+                    "Migrations are committed but interface reload failed; fix interfaces and reload",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let mut state = database.state.lock().unwrap();
+    let old = std::mem::replace(&mut state.snapshot, snapshot);
+    state.phase = if published {
+        Phase::Ready
+    } else {
+        Phase::Unloaded
+    };
+    state.pause_reason = None;
+    let progress = state.current.as_mut().unwrap().migration.as_mut().unwrap();
+    progress.step = MigrationStep::Complete;
+    progress.interfaces_reloaded = published;
+    drop(state);
+    drop(old);
+    Ok(())
 }
 
 async fn open_resources(config: Configuration) -> Result<Resources, SqlrestError> {

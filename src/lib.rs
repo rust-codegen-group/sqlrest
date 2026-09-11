@@ -1,6 +1,7 @@
 pub mod error;
 pub mod execution;
 pub mod loader;
+pub mod migration;
 pub mod params;
 mod postgres_driver;
 pub mod registry;
