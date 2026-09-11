@@ -1,0 +1,5 @@
+CREATE TABLE todos (
+    id INTEGER PRIMARY KEY NOT NULL CHECK (id BETWEEN 1 AND 9007199254740991),
+    title TEXT NOT NULL CHECK (length(title) > 0),
+    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
+) STRICT;

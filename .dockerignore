@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!LICENSE-MIT
+!LICENSE-APACHE
+!target/
+target/*
+!target/release/
+target/release/*
+!target/release/sqlrest

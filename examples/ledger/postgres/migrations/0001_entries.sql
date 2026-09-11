@@ -1,0 +1,5 @@
+CREATE TABLE entries (
+    id TEXT PRIMARY KEY CHECK (length(id) > 0),
+    amount_minor BIGINT NOT NULL CHECK (amount_minor BETWEEN -9007199254740991 AND 9007199254740991),
+    note TEXT NOT NULL
+);

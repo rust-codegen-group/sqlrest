@@ -154,4 +154,5 @@ OPENAPI_NEXUS_BIN=/absolute/path/to/openapi-nexus \
 
 The SDK test requires `tsc` on PATH. It generates TypeScript in a temporary
 directory, compiles it strictly, and checks that recursive child fields retain
-their types. It does not test HTTP calls; that belongs to end-to-end delivery.
+their types. Real generated-client calls against the checked-in examples are
+covered by `examples_contract` / `scripts/e2e.py --sdk`; see `delivery.md`.

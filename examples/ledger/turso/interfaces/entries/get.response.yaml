@@ -1,0 +1,7 @@
+type: object
+required: [id, amount_minor, note]
+additionalProperties: false
+properties:
+  id: {type: string}
+  amount_minor: {type: integer, format: int64}
+  note: {type: string}

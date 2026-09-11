@@ -1,0 +1,9 @@
+type: object
+required: [balance_minor]
+additionalProperties: false
+properties:
+  balance_minor:
+    type: integer
+    format: int64
+    minimum: -9007199254740991
+    maximum: 9007199254740991
