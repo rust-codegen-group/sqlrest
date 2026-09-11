@@ -287,6 +287,16 @@ impl Snapshot {
                     "method_not_allowed",
                     "Method not defined for this route",
                 )
+                .with_allowed_methods(
+                    self.endpoints
+                        .iter()
+                        .filter(|e| e.path == first.path)
+                        .map(|e| e.method.to_uppercase())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
             })?;
         Ok(MatchedEndpoint {
             endpoint: endpoint.clone(),

@@ -4,12 +4,12 @@
 use crate::{
     SqlrestError,
     execution::{Executor, Limits},
-    loader::Snapshot,
+    loader::{MatchedEndpoint, Snapshot},
     migration::{AppliedMigration, Migrator, Plan},
     params::Input,
     sql::Backend,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::sync::Notify;
@@ -77,9 +77,26 @@ pub enum Phase {
     RegistrationFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OperationId(u64);
+
+impl std::str::FromStr for OperationId {
+    type Err = SqlrestError;
+
+    fn from_str(value: &str) -> Result<Self, SqlrestError> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(SqlrestError::new(
+                400,
+                "invalid_operation_id",
+                "Expected a numeric operation ID",
+            ));
+        }
+        value.parse::<u64>().map(Self).map_err(|_| {
+            SqlrestError::new(400, "invalid_operation_id", "Operation ID is out of range")
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +162,14 @@ pub struct Status {
 #[derive(Clone, Default)]
 pub struct Registry {
     entries: Arc<Mutex<BTreeMap<String, Arc<Database>>>>,
+    shutdown: Arc<Shutdown>,
+}
+
+#[derive(Default)]
+struct Shutdown {
+    closed: AtomicBool,
+    result: Mutex<Option<Result<(), SqlrestError>>>,
+    changed: Notify,
 }
 
 struct Database {
@@ -203,6 +228,7 @@ impl Registry {
         let config = config.normalize()?;
         let (database, new) = {
             let mut entries = self.entries.lock().unwrap();
+            self.check_open()?;
             let existing = entries
                 .get(name)
                 .filter(|db| db.state.lock().unwrap().phase != Phase::Unregistered);
@@ -308,8 +334,7 @@ impl Registry {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             SqlrestError::definition("Management operations require a Tokio runtime")
         })?;
-        let database = self.database(name)?;
-        let id = begin(&database, OperationKind::Reload)?;
+        let (database, id) = self.start_operation(name, OperationKind::Reload)?;
         runtime.spawn(async move {
             let config = database.config.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -342,8 +367,7 @@ impl Registry {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             SqlrestError::definition("Management operations require a Tokio runtime")
         })?;
-        let database = self.database(name)?;
-        let id = begin(&database, OperationKind::Migrate)?;
+        let (database, id) = self.start_operation(name, OperationKind::Migrate)?;
         runtime.spawn(async move {
             let working = database.clone();
             let result = tokio::spawn(async move { run_migration(&working).await })
@@ -370,8 +394,10 @@ impl Registry {
         &self,
         name: &str,
     ) -> Result<Vec<AppliedMigration>, SqlrestError> {
-        let database = self.database(name)?;
         let (migrator, lifetime) = {
+            let entries = self.entries.lock().unwrap();
+            self.check_open()?;
+            let database = lookup(&entries, name)?;
             let mut state = database.state.lock().unwrap();
             if !matches!(state.phase, Phase::Ready | Phase::Unloaded | Phase::Paused) {
                 return Err(unavailable());
@@ -403,8 +429,7 @@ impl Registry {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             SqlrestError::definition("Management operations require a Tokio runtime")
         })?;
-        let database = self.database(name)?;
-        let id = begin(&database, OperationKind::Unregister)?;
+        let (database, id) = self.start_operation(name, OperationKind::Unregister)?;
         runtime.spawn(async move {
             loop {
                 let changed = database.changed.notified();
@@ -463,10 +488,23 @@ impl Registry {
         name: &str,
         method: &str,
         segments: &[&str],
-        mut input: Input,
+        input: Input,
     ) -> Result<Vec<u8>, SqlrestError> {
-        let database = self.database(name)?;
-        let (executor, matched, lifetime) = {
+        self.admit(name, method, segments)?
+            .execute(input, None)
+            .await
+    }
+
+    pub(crate) fn admit(
+        &self,
+        name: &str,
+        method: &str,
+        segments: &[&str],
+    ) -> Result<AdmittedRequest, SqlrestError> {
+        let (executor, matched, lifetime, limits) = {
+            let entries = self.entries.lock().unwrap();
+            self.check_open()?;
+            let database = lookup(&entries, name)?;
             let mut state = database.state.lock().unwrap();
             if state.phase != Phase::Ready {
                 return Err(unavailable());
@@ -479,29 +517,158 @@ impl Registry {
                 database: database.clone(),
                 _snapshot: Some(snapshot),
             };
-            (executor, matched, lifetime)
+            (executor, matched, lifetime, database.config.limits)
         };
-        // Never trust caller-supplied path parameters over the resolved route.
-        input.path = matched.path_parameters;
-        executor
-            .execute_tracked(matched.endpoint, input, database.config.limits, lifetime)
+        Ok(AdmittedRequest {
+            executor,
+            matched,
+            limits,
+            lifetime,
+        })
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.closed.load(Ordering::Acquire)
+    }
+
+    /// Permanently close admission, finish accepted work, and release resources.
+    /// Once started, dropping this waiter does not cancel shutdown.
+    pub async fn shutdown(&self) -> Result<(), SqlrestError> {
+        self.start_shutdown()?;
+        loop {
+            let changed = self.shutdown.changed.notified();
+            if let Some(result) = self.shutdown.result.lock().unwrap().clone() {
+                return result;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn start_shutdown(&self) -> Result<(), SqlrestError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| SqlrestError::definition("Shutdown requires a Tokio runtime"))?;
+        let databases = {
+            let entries = self.entries.lock().unwrap();
+            if self.shutdown.closed.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            entries.values().cloned().collect::<Vec<_>>()
+        };
+        let shutdown = self.shutdown.clone();
+        runtime.spawn(async move {
+            let result = tokio::spawn(async move {
+                let mut failure = None;
+                for database in databases {
+                    loop {
+                        let changed = database.changed.notified();
+                        {
+                            let state = database.state.lock().unwrap();
+                            if state.phase != Phase::Registering
+                                && state.current.is_none()
+                                && state.active == 0
+                            {
+                                break;
+                            }
+                        }
+                        changed.await;
+                    }
+                    let resources = {
+                        let mut state = database.state.lock().unwrap();
+                        state.phase = Phase::Unregistering;
+                        (state.resources.take(), state.snapshot.take())
+                    };
+                    if tokio::task::spawn_blocking(move || drop(resources))
+                        .await
+                        .is_err()
+                    {
+                        failure = Some(worker_failed());
+                    }
+                    let mut state = database.state.lock().unwrap();
+                    state.phase = Phase::Unregistered;
+                    state.pause_reason = None;
+                    drop(state);
+                    database.changed.notify_waiters();
+                }
+                failure.map_or(Ok(()), Err)
+            })
             .await
+            .unwrap_or_else(|_| Err(worker_failed()));
+            *shutdown.result.lock().unwrap() = Some(result);
+            shutdown.changed.notify_waiters();
+        });
+        Ok(())
+    }
+
+    fn check_open(&self) -> Result<(), SqlrestError> {
+        if self.is_shutting_down() {
+            Err(shutting_down())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn start_operation(
+        &self,
+        name: &str,
+        kind: OperationKind,
+    ) -> Result<(Arc<Database>, OperationId), SqlrestError> {
+        let entries = self.entries.lock().unwrap();
+        self.check_open()?;
+        let database = lookup(&entries, name)?;
+        let id = begin(&database, kind)?;
+        Ok((database, id))
     }
 
     fn database(&self, name: &str) -> Result<Arc<Database>, SqlrestError> {
-        self.entries
-            .lock()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                SqlrestError::new(
-                    404,
-                    "database_not_found",
-                    "Database configuration not found",
-                )
-            })
+        lookup(&self.entries.lock().unwrap(), name)
     }
+}
+
+// Release executor ownership before the drain lease when an upload/parse fails.
+pub(crate) struct AdmittedRequest {
+    executor: Executor,
+    matched: MatchedEndpoint,
+    pub limits: Limits,
+    lifetime: RequestLifetime,
+}
+
+impl AdmittedRequest {
+    pub async fn execute(
+        self,
+        mut input: Input,
+        remaining: Option<std::time::Duration>,
+    ) -> Result<Vec<u8>, SqlrestError> {
+        let Self {
+            executor,
+            matched,
+            mut limits,
+            lifetime,
+        } = self;
+        if let Some(remaining) = remaining {
+            limits.timeout = limits.timeout.min(remaining);
+        }
+        input.path = matched.path_parameters;
+        executor
+            .execute_tracked(matched.endpoint, input, limits, lifetime)
+            .await
+    }
+}
+
+fn lookup(
+    entries: &BTreeMap<String, Arc<Database>>,
+    name: &str,
+) -> Result<Arc<Database>, SqlrestError> {
+    entries.get(name).cloned().ok_or_else(|| {
+        SqlrestError::new(
+            404,
+            "database_not_found",
+            "Database configuration not found",
+        )
+    })
+}
+
+pub(crate) fn shutting_down() -> SqlrestError {
+    SqlrestError::new(503, "server_shutting_down", "Server is shutting down")
 }
 
 struct RequestLifetime {

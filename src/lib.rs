@@ -1,5 +1,6 @@
 pub mod error;
 pub mod execution;
+pub mod http;
 pub mod loader;
 pub mod migration;
 pub mod params;

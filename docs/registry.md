@@ -124,5 +124,12 @@ latest completed operation, not an operation history. Older results return
 registration, even if that name is later reused. Retired names have no time-based
 expiry and remain until reused or the Registry is dropped. Registry/process
 restart loses all names, snapshots and operation IDs; the runtime must re-register.
-There is no persisted registry/operation queue or HTTP protocol here.
+There is no persisted registry/operation queue. The HTTP transport is described in
+`http.md`.
 Forward-only migration history and recovery are described in `migrations.md`.
+
+`Registry::shutdown().await` permanently closes new admission across all clones,
+waits for accepted registration, management operations and request cleanup, then
+releases database resources. It is idempotent; cancelling a shutdown waiter does
+not cancel the coordinator. Status and retained operation results remain readable.
+Keep the Tokio runtime alive until completion. Create a new Registry to restart.

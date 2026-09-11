@@ -539,3 +539,53 @@ async fn dropped_registration_waiter_does_not_cancel_reserved_registration() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn shutdown_survives_waiter_cancellation_and_waits_for_registration() {
+    let registry = Registry::new();
+    let fixture = Fixture::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut postgres = tokio_postgres::Config::new();
+    postgres
+        .host("127.0.0.1")
+        .port(listener.local_addr().unwrap().port())
+        .user("test");
+    let mut config = fixture.config.clone();
+    config.target = Target::PostgresUnencrypted(Box::new(postgres));
+    config.limits.timeout = Duration::from_millis(200);
+    let registering = registry.clone();
+    let registration = tokio::spawn(async move { registering.register("db", config).await });
+    let (_socket, _) = listener.accept().await.unwrap();
+    let closing = registry.clone();
+    let waiter = tokio::spawn(async move { closing.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !registry.is_shutting_down() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!waiter.is_finished());
+    waiter.abort();
+    assert_eq!(
+        registry
+            .register("new", fixture.config)
+            .await
+            .unwrap_err()
+            .code,
+        "server_shutting_down"
+    );
+    assert_eq!(
+        registry.reload("db").unwrap_err().code,
+        "server_shutting_down"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let (a, b) = tokio::join!(registry.shutdown(), registry.shutdown());
+        a.unwrap();
+        b.unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(registration.await.unwrap().is_err());
+    registry.shutdown().await.unwrap();
+}

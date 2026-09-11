@@ -10,6 +10,8 @@ pub struct SqlrestError {
     #[serde(skip)]
     pub status: u16,
     #[serde(skip)]
+    pub(crate) allowed_methods: Option<String>,
+    #[serde(skip)]
     diagnostic: Option<std::sync::Arc<str>>,
 }
 
@@ -20,6 +22,7 @@ impl SqlrestError {
             code: code.into(),
             message: message.into(),
             parameter: None,
+            allowed_methods: None,
             diagnostic: None,
         }
     }
@@ -43,6 +46,11 @@ impl SqlrestError {
         });
         let _ = writeln!(std::io::stderr().lock(), "{record}");
         self.diagnostic = Some(diagnostic.into());
+        self
+    }
+
+    pub(crate) fn with_allowed_methods(mut self, methods: String) -> Self {
+        self.allowed_methods = Some(methods);
         self
     }
 

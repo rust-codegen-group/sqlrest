@@ -40,7 +40,8 @@ The timeout is not a hard real-time return guarantee. Cleanup is allowed its own
 five-second budget, and synchronous driver/OS calls may take longer to return.
 Pure CPU validation tasks may finish in the background after cancellation but
 cannot subsequently start SQL or commit. Keep the Tokio runtime alive for cleanup;
-runtime/process shutdown is not a graceful-drain API.
+await `Registry::shutdown()` (or graceful HTTP server completion) before stopping
+the runtime. Abrupt runtime/process termination is not graceful drain.
 
 Connections are closed/discarded, never pooled or reused. SQLRest does not retry
 business statements. A cancellation request alone is not proof of rollback.
