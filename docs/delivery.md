@@ -12,14 +12,17 @@ claim or automatic upgrade.
 Linux is the verified delivery platform. CI runs Ubuntu 22.04, tests against
 PostgreSQL **18.3** from pinned `postgres:18-alpine` digest
 `sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7`,
-and uses Node **24.15.0**, TypeScript **6.0.3**, and openapi-nexus revision
-`1f8e1d8a3264d697c3aca8db7db01148d878115a`.
+and uses Node **24.15.0**, TypeScript **6.0.3**, and the openapi-nexus **0.2.3**
+release binary. CI and local SDK verification use
+`scripts/download-openapi-nexus.sh` to download and extract the Linux x86_64 musl
+archive. No generator source is cloned or compiled; download or extraction
+errors fail the setup.
 
 On Ubuntu 22.04:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential clang libclang-dev pkg-config python3 curl jq
+sudo apt-get install -y build-essential clang libclang-dev pkg-config python3 curl jq xz-utils
 cargo build --locked
 cargo test --locked
 ```
@@ -57,11 +60,13 @@ docker run --name sqlrest-demo \
   --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=$SQLREST_DEMO,dst=/workspace" \
   -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
-  sqlrest:local --data-listen 0.0.0.0:8080 --management-listen 0.0.0.0:8081
+  sqlrest:local --workspace /workspace \
+  --data-listen 0.0.0.0:8080 --management-listen 0.0.0.0:8081
 ```
 
 `SQLREST_DEMO` is the absolute persistent directory from the getting-started guide.
-Adjust registration paths to `/workspace/todolist/...` **inside the container**.
+The fixed layout is `/workspace/databases/todolist/...` inside the container;
+publish requests do not carry paths.
 Default image user is numeric 65532; the example uses the caller's UID/GID for
 bind-mount access. This does not restrict socket addresses. Proxy authorization
 and exposure policy still belong to the runtime/deployer.
@@ -81,9 +86,12 @@ Provision two disposable PG databases: a core-test database and a separate
 new for another run. Then:
 
 ```sh
+SQLREST_TOOLS=$(mktemp -d)
+bash scripts/download-openapi-nexus.sh "$SQLREST_TOOLS/openapi-nexus"
+
 SQLREST_TEST_POSTGRES='postgresql://user:password@host/core_test' \
 SQLREST_EXAMPLES_POSTGRES='postgresql://user:password@host/examples_test' \
-OPENAPI_NEXUS_BIN=/absolute/path/to/openapi-nexus \
+OPENAPI_NEXUS_BIN="$SQLREST_TOOLS/openapi-nexus/openapi-nexus" \
   bash scripts/check.sh
 ```
 
@@ -107,13 +115,13 @@ by checking in a workflow; local verification and hosted CI are distinct evidenc
 `Registry::shutdown().await` or graceful `Server::serve` completion. A forcibly
 stopped runtime cannot attest rollback or commit state.
 
-Keep runtime configuration and database backups independently. Recovering original
+Keep workspace configuration and database backups independently. Recovering original
 migration source repairs history mismatch; it cannot recover deleted business
 data. Designate one migrator for each PG database and one process owner for a
 Turso file. Shared DB aliases do not create isolation or separate migration history.
 
 The bundled skill is self-contained: distribute `skills/sqlrest-runtime` as a
-directory. It directs the agent to check actual behavior after automatic resume,
+directory. It directs the agent to check actual behavior after publish,
 preserve edited historical files before restoration, poll asynchronous operations
 and avoid blind retries after an unknown commit. It is guidance, not a security
 boundary or a substitute for runtime authorization.

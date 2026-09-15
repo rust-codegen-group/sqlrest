@@ -1,63 +1,42 @@
 # A persistent Todolist API
 
-Use an unused local directory and two available ports. Prerequisites: the README
-build tools plus `curl` and `jq`. These commands run from the repository root.
-They use your own local DB; unlike `scripts/e2e.py`, this guide does not delete it.
+Run from the repository root with Rust build tools, `curl` and `jq`.
+Use an unused local directory; these commands retain your data.
 
-## Build, copy and start
+## Prepare layout and start
 
 ```sh
 cargo build --locked
 SQLREST_DEMO="$(mktemp -d)"
-cp -R examples/todolist/turso "$SQLREST_DEMO/todolist"
-jq -n --arg root "$SQLREST_DEMO/todolist" '{
-  database: {kind:"turso", path:($root+"/data.db")},
-  interfaces:($root+"/interfaces"),
-  migrations:($root+"/migrations"),
-  limits:{timeout_ms:5000,max_rows:100}
-}' > "$SQLREST_DEMO/registration.json"
-echo "Keep this runtime-owned directory: $SQLREST_DEMO"
-target/debug/sqlrest --data-listen 127.0.0.1:8080 --management-listen 127.0.0.1:8081
+mkdir -p "$SQLREST_DEMO/databases"
+cp -R examples/todolist/turso "$SQLREST_DEMO/databases/todolist"
+echo "Keep this workspace: $SQLREST_DEMO"
+target/debug/sqlrest --workspace "$SQLREST_DEMO" \
+  --data-listen 127.0.0.1:8080 --management-listen 127.0.0.1:8081
 ```
 
-Keep the service running in that terminal. In another terminal, set `SQLREST_DEMO`
-to the printed absolute directory. The runtime normally persists this config
-and supervises the process; SQLRest itself does neither.
+Keep that terminal running. SQLRest manages `database.toml` and `data.db` under
+the copied directory. The Agent edits only interfaces and migrations.
+The addresses are examples, not a loopback restriction; protect both listeners.
 
-## Register, migrate, publish
+## Publish and check
+
+In another terminal:
 
 ```sh
-curl -fsS -X PUT http://127.0.0.1:8081/databases/todolist \
-  -H 'Content-Type: application/json' --data-binary @"$SQLREST_DEMO/registration.json"
-curl -fsS -X POST http://127.0.0.1:8081/databases/todolist/migrate
+SQLREST_OPERATION=$(curl -fsS -X POST http://127.0.0.1:8081/databases/todolist/publish \
+  -H 'Content-Type: application/json' -d '{"database":{"kind":"turso"}}' \
+  | jq -r .operation_id)
+curl -fsS "http://127.0.0.1:8081/databases/todolist/operations/$SQLREST_OPERATION"
 ```
 
-Registration returns `unloaded`. The second call returns an operation ID, not
-completion. Substitute its ID below and poll until `outcome` is `succeeded` or
-`failed` (a client polling deadline is not proof of failure):
-
-```sh
-curl -fsS http://127.0.0.1:8081/databases/todolist/operations/1
-```
-
-On success, publish the first snapshot:
-
-```sh
-curl -fsS -X POST http://127.0.0.1:8081/databases/todolist/reload
-```
-
-Poll the **new returned ID**, then check status is `ready`. IDs are global and
-not guaranteed sequential for one database. If an acknowledgement is lost, status
-contains the current/latest operation:
+Poll the returned ID until `outcome` is `succeeded` or `failed`; 202 only means
+accepted. Publish handles first registration, migration and interface loading.
+On success check status, OpenAPI and behavior:
 
 ```sh
 curl -fsS http://127.0.0.1:8081/databases/todolist
 curl -fsS http://127.0.0.1:8081/databases/todolist/openapi
-```
-
-## Create, read, update and query an ID array
-
-```sh
 curl -fsS http://127.0.0.1:8080/db/todolist/todos \
   -H 'Content-Type: application/json' \
   -d '{"id":41,"title":"Read the contract","completed":false}'
@@ -68,46 +47,55 @@ curl -fsS http://127.0.0.1:8080/db/todolist/todos/lookup \
   -H 'Content-Type: application/json' -d '{"ids":[41,42]}'
 ```
 
-The boolean must be `true`/`false`, not `"true"` or 1. The lookup returns only
-matching records. Missing IDs produce an empty array, not an implicit 404.
-For the create retry, use the original stable ID and compare the returned row:
-the example uses first-write-wins and never overwrites an existing record on POST.
+Booleans must be JSON booleans, not strings or 0/1. Missing IDs return an empty
+records array. Create retries use the original stable ID and compare returned
+values: the example is first-write-wins, not an upsert on changed payload.
 
-## Restart and recover
+## Update, restart and unregister
 
-Ctrl-C the service and await its exit. Start the same command again. Status is
-now 404 because registration is volatile, but the DB file is still present.
-Repeat register → migrate → reload, waiting for each operation to succeed.
-GET `/db/todolist/todos/41` must still return the updated record. Do not skip
-verification merely because migration automatically resumed a published database.
-
-To delete your example record explicitly:
+Finish editing files, then publish again:
 
 ```sh
-curl -fsS -X DELETE http://127.0.0.1:8080/db/todolist/todos/41
+curl -fsS -X POST http://127.0.0.1:8081/databases/todolist/publish \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
-Deleting a registration does not delete the database file. Preserve that file and
-the saved registration config for subsequent restarts.
+Omitted limits reset to 5000 ms and 1000 rows on every publish; omitted database
+configuration reuses the saved connection. Poll and check affected behavior.
+Use `migration_timeout_ms` in this request to override the 60000 ms migration
+batch budget; it does not change the business request timeout.
+
+Ctrl-C and wait for exit, then start the same command with the same workspace.
+The API and data recover without republishing. A blocked publication remains
+blocked; repair the cause and publish. Old operation IDs return 404 after restart,
+which is not evidence the operation failed or never ran.
+
+```sh
+curl -fsS -X DELETE http://127.0.0.1:8081/databases/todolist
+```
+
+Poll this unregister operation too. It removes the registration TOML, not the
+database or source files. Later publish must include database configuration again.
 
 ## PostgreSQL and shared databases
 
-Copy `examples/todolist/postgres` instead and replace the target:
+Copy `examples/todolist/postgres` instead and publish with:
 
 ```json
-{"kind":"postgres_unencrypted","connection":"postgresql://user:password@host/todolist"}
+{
+  "database": {
+    "kind": "postgres_unencrypted",
+    "connection": "postgresql://user:password@host/todolist"
+  }
+}
 ```
 
-Create the database/role outside SQLRest with your normal provisioning process.
-The current constructor is unencrypted: use only an appropriately protected
-connection. Do not put this connection string in browser code or OpenAPI.
-Different databases may share the same server endpoint.
+Provision the remote database/role outside SQLRest. This transport is explicitly
+unencrypted; keep it protected and never put credentials in browser code.
+Providing a changed connection on publish switches targets, not data.
 
-If Todolist and Ledger share a **single** PG database, deploy their tables under
-one ordered migration history: `0001_todos.sql`, then `0002_entries.sql`,
-with both interface trees combined. Do not independently apply two `0001_...`
-histories to the same database. Multiple aliases need that same coherent history
-and one runtime-appointed migrator. `scripts/e2e.py --backend postgres` exercises
-this shared-database case against `SQLREST_TEST_POSTGRES`, which must be a fresh,
-disposable empty database. The script leaves its sample data there; the caller
-owns database teardown. It never drops an existing database to make a test pass.
+Aliases sharing one PostgreSQL database share one migration history. Each fixed
+layout must contain the same coherent history, and the runtime appoints one
+migrator. Combine Todolist's `0001_todos.sql` and Ledger's migration renamed to
+`0002_entries.sql`; do not independently run conflicting `0001` migrations.
+`scripts/e2e.py --backend postgres` tests this with a disposable empty database.

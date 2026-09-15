@@ -1,15 +1,14 @@
 use serde_json::{Value, json};
 use sqlrest::{
-    execution::Limits,
     params::Input,
     registry::{
-        Configuration, MigrationStep, Operation, Outcome, PauseReason, Phase, Registry, Target,
+        DatabaseConfig, Operation, Outcome, Phase, PublishRequest, PublishStep, Recovery, Registry,
     },
     sql::Backend,
 };
 use std::{
     fs,
-    path::Path,
+    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -22,15 +21,21 @@ const SECOND: &str = "CREATE TABLE rolled_back(id BIGINT); INSERT INTO items VAL
 
 struct Harness {
     registry: Registry,
-    config: Configuration,
+    config: Fixture,
     directory: tempfile::TempDir,
+}
+
+struct Fixture {
+    interfaces: PathBuf,
+    migrations: PathBuf,
+    request: PublishRequest,
 }
 
 impl Harness {
     async fn new(backend: Backend) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let target = match backend {
-            Backend::Turso => Target::Turso(directory.path().join("data.db")),
+            Backend::Turso => DatabaseConfig::Turso {},
             Backend::Postgres => {
                 let mut config: tokio_postgres::Config = std::env::var("SQLREST_TEST_POSTGRES")
                     .expect("Set SQLREST_TEST_POSTGRES to a disposable database")
@@ -50,28 +55,32 @@ impl Harness {
                     .await
                     .unwrap();
                 config.dbname(&name);
-                Target::PostgresUnencrypted(Box::new(config))
+                let mut url =
+                    url::Url::parse(&std::env::var("SQLREST_TEST_POSTGRES").unwrap()).unwrap();
+                url.set_path(&name);
+                DatabaseConfig::PostgresUnencrypted {
+                    connection: url.into(),
+                }
             }
         };
-        let config = Configuration {
-            target,
-            interfaces: directory.path().join("interfaces"),
-            migrations: directory.path().join("migrations"),
-            limits: Limits {
-                timeout: Duration::from_secs(5),
-                max_rows: 10,
+        let config = Fixture {
+            interfaces: directory.path().join("databases/db/interfaces"),
+            migrations: directory.path().join("databases/db/migrations"),
+            request: PublishRequest {
+                database: Some(target),
+                ..Default::default()
             },
         };
-        fs::create_dir(&config.interfaces).unwrap();
-        fs::create_dir(&config.migrations).unwrap();
-        let registry = Registry::new();
-        registry.register("db", config.clone()).await.unwrap();
+        fs::create_dir_all(&config.interfaces).unwrap();
+        fs::create_dir_all(&config.migrations).unwrap();
+        let registry = Registry::open(directory.path()).await.unwrap();
         let harness = Self {
             registry,
             config,
             directory,
         };
         harness.interfaces("SELECT value FROM items ORDER BY value");
+        succeeded(harness.migrate().await);
         harness
     }
 
@@ -85,7 +94,10 @@ impl Harness {
     }
 
     async fn migrate(&self) -> Operation {
-        let id = self.registry.migrate("db").unwrap();
+        let id = self
+            .registry
+            .publish("db", self.config.request.clone())
+            .unwrap();
         tokio::time::timeout(
             Duration::from_secs(10),
             self.registry.wait_operation("db", id),
@@ -96,7 +108,10 @@ impl Harness {
     }
 
     async fn reload(&self) {
-        let id = self.registry.reload("db").unwrap();
+        let id = self
+            .registry
+            .publish("db", self.config.request.clone())
+            .unwrap();
         assert_eq!(
             self.registry
                 .wait_operation("db", id)
@@ -131,20 +146,13 @@ async fn workflow(backend: Backend) {
     let h = Harness::new(backend).await;
     assert!(h.registry.export_migrations("db").await.unwrap().is_empty());
     let empty = succeeded(h.migrate().await);
-    assert!(empty.migration.unwrap().applied_versions.is_empty());
-    assert_eq!(h.registry.status("db").unwrap().phase, Phase::Unloaded);
+    assert!(empty.publish.unwrap().applied_versions.is_empty());
+    assert_eq!(h.registry.status("db").unwrap().phase, Phase::Ready);
     h.file("0001_initial.sql", FIRST);
     let first = succeeded(h.migrate().await);
-    assert_eq!(first.migration.unwrap().applied_versions, vec![1]);
-    assert_eq!(h.registry.status("db").unwrap().phase, Phase::Unloaded);
-    assert_eq!(
-        h.registry
-            .execute("db", "get", &[], Input::default())
-            .await
-            .unwrap_err()
-            .status,
-        503
-    );
+    assert_eq!(first.publish.unwrap().applied_versions, vec![1]);
+    assert_eq!(h.registry.status("db").unwrap().phase, Phase::Ready);
+    assert_eq!(h.values().await, json!({"records":[{"value":"one"}]}));
     let history = h.registry.export_migrations("db").await.unwrap();
     assert_eq!(history[0].source, FIRST);
     assert_eq!(history[0].filename, "0001_initial.sql");
@@ -156,10 +164,9 @@ async fn workflow(backend: Backend) {
     );
     h.interfaces("SELECT extra AS value FROM items");
     let op = succeeded(h.migrate().await);
-    let progress = op.migration.unwrap();
+    let progress = op.publish.unwrap();
     assert_eq!(progress.applied_versions, vec![3]);
-    assert!(progress.interfaces_reloaded);
-    assert_eq!(progress.step, MigrationStep::Complete);
+    assert_eq!(progress.step, PublishStep::Complete);
     assert_ne!(h.registry.status("db").unwrap().version, old);
     assert_eq!(h.values().await, json!({"records":[{"value":"new"}]}));
     h.file("0001_initial.sql", "SELECT 'edited';");
@@ -183,7 +190,7 @@ async fn workflow(backend: Backend) {
     }
     assert!(
         succeeded(h.migrate().await)
-            .migration
+            .publish
             .unwrap()
             .applied_versions
             .is_empty()
@@ -196,29 +203,25 @@ async fn failures(backend: Backend) {
     h.file("0002_broken.sql", BROKEN);
     let failed = h.migrate().await;
     assert_eq!(failed.outcome, Outcome::Failed);
-    let progress = failed.migration.unwrap();
+    let progress = failed.publish.unwrap();
     assert_eq!(progress.applied_versions, vec![1]);
     assert_eq!(progress.failed_version, Some(2));
     assert_eq!(
-        h.registry.status("db").unwrap().pause_reason,
-        Some(PauseReason::MigrationFailed)
-    );
-    assert_eq!(
-        h.registry.reload("db").unwrap_err().code,
-        "migration_recovery_required"
+        h.registry.status("db").unwrap().recovery,
+        Some(Recovery::Migration)
     );
     let history = h.registry.export_migrations("db").await.unwrap();
     assert_eq!(history.len(), 1);
     h.file("0002_broken.sql", "BEGIN; COMMIT;");
     failure(h.migrate().await, "invalid_migration");
     assert_eq!(
-        h.registry.status("db").unwrap().pause_reason,
-        Some(PauseReason::MigrationFailed)
+        h.registry.status("db").unwrap().recovery,
+        Some(Recovery::Migration)
     );
     h.file("0002_broken.sql", SECOND);
     // Successful CREATE TABLE proves that the failed file's DDL rolled back.
     succeeded(h.migrate().await);
-    assert_eq!(h.registry.status("db").unwrap().phase, Phase::Unloaded);
+    assert_eq!(h.registry.status("db").unwrap().phase, Phase::Ready);
     h.reload().await;
     assert_eq!(
         h.values().await,
@@ -226,10 +229,10 @@ async fn failures(backend: Backend) {
     );
     h.file("0003_committed.sql", "INSERT INTO items VALUES('three');");
     h.interfaces("SELECT ${invalid}");
-    failure(h.migrate().await, "migration_reload_failed");
+    assert_eq!(h.migrate().await.outcome, Outcome::Failed);
     assert_eq!(
-        h.registry.status("db").unwrap().pause_reason,
-        Some(PauseReason::ReloadFailed)
+        h.registry.status("db").unwrap().recovery,
+        Some(Recovery::Reload)
     );
     assert_eq!(h.registry.export_migrations("db").await.unwrap().len(), 3);
     assert_eq!(
@@ -242,7 +245,10 @@ async fn failures(backend: Backend) {
     );
     h.interfaces("SELECT value FROM items ORDER BY value");
     h.reload().await;
-    assert_eq!(h.registry.status("db").unwrap().pause_reason, None);
+    assert_eq!(
+        h.registry.status("db").unwrap().recovery,
+        Some(Recovery::None)
+    );
     assert_eq!(h.values().await["records"].as_array().unwrap().len(), 3);
 }
 
@@ -270,7 +276,7 @@ async fn snapshot_and_drain(backend: Backend) {
     .unwrap();
     let original = "INSERT INTO items VALUES('snapshot');";
     h.file("0002_snapshot.sql", original);
-    let id = h.registry.migrate("db").unwrap();
+    let id = h.registry.publish("db", h.config.request.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while h
             .registry
@@ -278,10 +284,10 @@ async fn snapshot_and_drain(backend: Backend) {
             .unwrap()
             .current_operation
             .as_ref()
-            .and_then(|op| op.migration.as_ref())
+            .and_then(|op| op.publish.as_ref())
             .unwrap()
             .step
-            != MigrationStep::Draining
+            != PublishStep::Draining
         {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -289,7 +295,10 @@ async fn snapshot_and_drain(backend: Backend) {
     .await
     .unwrap();
     assert_eq!(
-        h.registry.reload("db").unwrap_err().code,
+        h.registry
+            .publish("db", h.config.request.clone())
+            .unwrap_err()
+            .code,
         "operation_in_progress"
     );
     assert_eq!(
@@ -297,7 +306,10 @@ async fn snapshot_and_drain(backend: Backend) {
         "operation_in_progress"
     );
     assert_eq!(
-        h.registry.migrate("db").unwrap_err().code,
+        h.registry
+            .publish("db", h.config.request.clone())
+            .unwrap_err()
+            .code,
         "operation_in_progress"
     );
     assert!(h.registry.openapi("db", "/db/db").is_ok());
@@ -358,7 +370,7 @@ async fn history_atomicity(backend: Backend) {
     // protocol to inspect rollback, not to claim the failed migration recovered.
     let id = h.registry.unregister("db").unwrap();
     succeeded(h.registry.wait_operation("db", id).await.unwrap());
-    h.registry.register("db", h.config.clone()).await.unwrap();
+    fs::remove_file(h.config.migrations.join("0002_history_failure.sql")).unwrap();
     fs::write(
         h.config.interfaces.join("post.sql"),
         "CREATE TABLE rolled_back(id BIGINT)",
@@ -394,9 +406,9 @@ async fn migration_timeout(backend: Backend) {
     let mut h = Harness::new(backend).await;
     let id = h.registry.unregister("db").unwrap();
     succeeded(h.registry.wait_operation("db", id).await.unwrap());
-    h.config.limits.timeout = Duration::from_secs(1);
-    h.config.limits.max_rows = 0;
-    h.registry.register("db", h.config.clone()).await.unwrap();
+    h.config.request.migration_timeout_ms = 1000;
+    h.config.request.limits.request_timeout_ms = 1;
+    h.config.request.limits.max_rows = 1;
     h.file("0001_initial.sql", FIRST);
     let slow = match backend {
         Backend::Turso => {
@@ -409,10 +421,10 @@ async fn migration_timeout(backend: Backend) {
     h.file("0002_timeout.sql", slow);
     failure(h.migrate().await, "execution_timeout");
     assert_eq!(
-        h.registry.status("db").unwrap().pause_reason,
-        Some(PauseReason::MigrationFailed)
+        h.registry.status("db").unwrap().recovery,
+        Some(Recovery::Migration)
     );
-    // Business max_rows=0 does not limit consumed migration SELECT results or
+    // Business max_rows=1 and request timeout do not limit migration SELECT results or
     // prevent exporting nonempty durable history.
     assert_eq!(h.registry.export_migrations("db").await.unwrap().len(), 1);
     h.file("0002_timeout.sql", SECOND);
@@ -493,7 +505,7 @@ async fn invalid_files_fail_preflight_without_partial_migrations() {
     ] {
         h.file(filename, source);
         failure(h.migrate().await, "invalid_migration");
-        assert_eq!(h.registry.status("db").unwrap().phase, Phase::Unloaded);
+        assert_eq!(h.registry.status("db").unwrap().phase, Phase::Ready);
         assert!(h.registry.export_migrations("db").await.unwrap().is_empty());
         fs::remove_file(h.config.migrations.join(filename)).unwrap();
     }
@@ -514,35 +526,25 @@ async fn invalid_files_fail_preflight_without_partial_migrations() {
 fn restart_worker() {
     let root = std::env::var("SQLREST_RECOVERY_ROOT").expect("helper requires recovery fixture");
     let mode = std::env::var("SQLREST_RECOVERY_MODE").unwrap();
-    let target = match std::env::var("SQLREST_RECOVERY_POSTGRES") {
-        Ok(url) => Target::PostgresUnencrypted(Box::new(url.parse().unwrap())),
-        Err(_) => Target::Turso(Path::new(&root).join("data.db")),
-    };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let registry = Registry::new();
-        registry
-            .register(
-                "db",
-                Configuration {
-                    target,
-                    interfaces: Path::new(&root).join("interfaces"),
-                    migrations: Path::new(&root).join("migrations"),
-                    limits: Limits {
-                        timeout: Duration::from_secs(5),
-                        max_rows: 10,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(registry.status("db").unwrap().phase, Phase::Unloaded);
-        assert_eq!(registry.status("db").unwrap().pause_reason, None);
-        let id = registry.migrate("db").unwrap();
+        let registry = Registry::open(&root).await.unwrap();
+        if mode == "recover" {
+            assert_eq!(
+                registry.status("db").unwrap().phase,
+                Phase::RecoveryRequired
+            );
+            assert_eq!(
+                registry.status("db").unwrap().recovery,
+                Some(Recovery::Migration)
+            );
+        }
+        // No connection details or registration replay from the parent.
+        let id = registry.publish("db", PublishRequest::default()).unwrap();
         if mode == "crash" {
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     let status = registry.status("db").unwrap();
-                    let progress = status.current_operation.unwrap().migration.unwrap();
+                    let progress = status.current_operation.unwrap().publish.unwrap();
                     if progress.current_version == Some(2) && progress.applied_versions == vec![1] {
                         // No registry drop, cancellation, or graceful shutdown.
                         std::process::exit(0);
@@ -559,16 +561,14 @@ fn restart_worker() {
             assert_eq!(op.outcome, Outcome::Failed);
             assert_eq!(registry.export_migrations("db").await.unwrap().len(), 1);
             assert_eq!(
-                registry.status("db").unwrap().pause_reason,
-                Some(PauseReason::MigrationFailed)
+                registry.status("db").unwrap().recovery,
+                Some(Recovery::Migration)
             );
             std::process::exit(0);
         }
         succeeded(op);
         assert_eq!(registry.export_migrations("db").await.unwrap().len(), 2);
-        assert_eq!(registry.status("db").unwrap().phase, Phase::Unloaded);
-        let id = registry.reload("db").unwrap();
-        succeeded(registry.wait_operation("db", id).await.unwrap());
+        assert_eq!(registry.status("db").unwrap().phase, Phase::Ready);
         let response = registry
             .execute("db", "get", &[], Input::default())
             .await
@@ -582,9 +582,6 @@ fn restart_worker() {
 
 async fn process_recovery(backend: Backend, crash: bool) {
     let h = Harness::new(backend).await;
-    // Release the parent's file ownership before the child starts.
-    let id = h.registry.unregister("db").unwrap();
-    succeeded(h.registry.wait_operation("db", id).await.unwrap());
     h.file("0001_initial.sql", FIRST);
     let slow = match backend {
         Backend::Turso => {
@@ -595,23 +592,24 @@ async fn process_recovery(backend: Backend, crash: bool) {
         }
     };
     h.file("0002_broken.sql", if crash { slow } else { BROKEN });
+    h.registry.shutdown().await.unwrap();
+    let Harness {
+        registry,
+        config,
+        directory,
+    } = h;
+    drop(registry);
     for mode in [if crash { "crash" } else { "fail" }, "recover"] {
         if mode == "recover" {
-            h.file("0002_broken.sql", SECOND);
+            fs::write(config.migrations.join("0002_broken.sql"), SECOND).unwrap();
         }
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
         child
             .args(["--ignored", "--exact", "restart_worker", "--nocapture"])
-            .env("SQLREST_RECOVERY_ROOT", h.directory.path())
+            .env("SQLREST_RECOVERY_ROOT", directory.path())
             .env("SQLREST_RECOVERY_MODE", mode)
             .env_remove("SQLREST_RECOVERY_POSTGRES")
             .kill_on_drop(true);
-        if let Target::PostgresUnencrypted(config) = &h.config.target {
-            let base = std::env::var("SQLREST_TEST_POSTGRES").unwrap();
-            let mut url = url::Url::parse(&base).expect("recovery test requires a PostgreSQL URL");
-            url.set_path(config.get_dbname().unwrap());
-            child.env("SQLREST_RECOVERY_POSTGRES", url.as_str());
-        }
         let output = tokio::time::timeout(Duration::from_secs(20), child.output())
             .await
             .unwrap()

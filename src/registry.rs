@@ -1,6 +1,7 @@
-//! In-memory database ownership, publication and operation tracking.
+//! Durable database ownership, unified publication and operation tracking.
 #![doc = include_str!("../docs/registry.md")]
 
+pub use crate::workspace::{DatabaseConfig, PublishRequest, Recovery, RequestLimits};
 use crate::{
     SqlrestError,
     execution::{Executor, Limits},
@@ -8,52 +9,58 @@ use crate::{
     migration::{AppliedMigration, Migrator, Plan},
     params::Input,
     sql::Backend,
+    workspace::{PersistentState, Record, Workspace, duration, validate_name},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
+    fmt,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::Notify;
 
 #[derive(Clone, PartialEq, Eq)]
-pub enum Target {
+enum Target {
     Turso(PathBuf),
-    /// Explicitly unencrypted, with the same transport contract as Executor.
     PostgresUnencrypted(Box<tokio_postgres::Config>),
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct Configuration {
-    pub target: Target,
-    pub interfaces: PathBuf,
-    pub migrations: PathBuf,
-    pub limits: Limits,
+#[derive(Clone)]
+struct Configuration {
+    target: Target,
+    interfaces: PathBuf,
+    migrations: PathBuf,
+    limits: Limits,
 }
 
 impl Configuration {
-    fn normalize(mut self) -> Result<Self, SqlrestError> {
-        self.interfaces = absolute(&self.interfaces)?;
-        self.migrations = absolute(&self.migrations)?;
-        if let Target::Turso(path) = &mut self.target {
-            *path = absolute(path)?;
-        }
-        if self.limits.timeout.is_zero()
-            || std::time::Instant::now()
-                .checked_add(self.limits.timeout)
-                .is_none()
-        {
-            return Err(SqlrestError::definition(
-                "Execution timeout must be positive and finite",
-            ));
-        }
-        Ok(self)
+    fn from_record(
+        workspace: &Workspace,
+        name: &str,
+        record: &Record,
+    ) -> Result<Self, SqlrestError> {
+        let root = workspace.directory(name);
+        let target = match &record.database {
+            DatabaseConfig::Turso {} => Target::Turso(root.join("data.db")),
+            DatabaseConfig::PostgresUnencrypted { connection } => {
+                Target::PostgresUnencrypted(Box::new(connection.parse().map_err(|_| {
+                    SqlrestError::definition("Invalid PostgreSQL connection configuration")
+                })?))
+            }
+        };
+        Ok(Self {
+            target,
+            interfaces: root.join("interfaces"),
+            migrations: root.join("migrations"),
+            limits: record.limits.validate()?,
+        })
     }
 
     fn backend(&self) -> Backend {
@@ -67,43 +74,109 @@ impl Configuration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    Registering,
-    Unloaded,
+    Publishing,
     Ready,
-    Migrating,
-    Paused,
+    RecoveryRequired,
     Unregistering,
     Unregistered,
-    RegistrationFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct OperationId(u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationId {
+    kind: OperationKind,
+    value: u128,
+}
+
+impl OperationId {
+    fn new(kind: OperationKind) -> Self {
+        Self {
+            kind,
+            value: uuid::Uuid::new_v4().as_u128(),
+        }
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut value = self.value;
+        let mut bytes = [b'0'; 25];
+        let mut start = bytes.len();
+        loop {
+            start -= 1;
+            bytes[start] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(value % 36) as usize];
+            value /= 36;
+            if value == 0 {
+                break;
+            }
+        }
+        write!(
+            formatter,
+            "{}-{}",
+            self.kind.prefix(),
+            std::str::from_utf8(&bytes[start..]).unwrap()
+        )
+    }
+}
+
+impl Serialize for OperationId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 impl std::str::FromStr for OperationId {
     type Err = SqlrestError;
 
     fn from_str(value: &str) -> Result<Self, SqlrestError> {
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(SqlrestError::new(
+        let invalid = || {
+            SqlrestError::new(
                 400,
                 "invalid_operation_id",
-                "Expected a numeric operation ID",
-            ));
+                "Expected an operation prefix and lowercase base36 UUID",
+            )
+        };
+        let (prefix, encoded) = value.split_once('-').ok_or_else(invalid)?;
+        let kind = match prefix {
+            "publish" => OperationKind::Publish,
+            "unregister" => OperationKind::Unregister,
+            _ => return Err(invalid()),
+        };
+        if encoded.is_empty()
+            || encoded.len() > 25
+            || !encoded
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+            || (encoded.len() > 1 && encoded.starts_with('0'))
+        {
+            return Err(invalid());
         }
-        value.parse::<u64>().map(Self).map_err(|_| {
-            SqlrestError::new(400, "invalid_operation_id", "Operation ID is out of range")
-        })
+        let value = u128::from_str_radix(encoded, 36).map_err(|_| invalid())?;
+        Ok(Self { kind, value })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
-    Reload,
-    Migrate,
+    Publish,
     Unregister,
+}
+
+impl OperationKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::Unregister => "unregister",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -120,33 +193,26 @@ pub struct Operation {
     pub kind: OperationKind,
     pub outcome: Outcome,
     pub error: Option<SqlrestError>,
-    pub migration: Option<MigrationProgress>,
+    pub publish: Option<PublishProgress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PauseReason {
-    MigrationFailed,
-    ReloadFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MigrationStep {
+pub enum PublishStep {
+    Connecting,
     Preflight,
     Draining,
     Applying,
-    Reloading,
+    Loading,
     Complete,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct MigrationProgress {
-    pub step: MigrationStep,
+pub struct PublishProgress {
+    pub step: PublishStep,
     pub applied_versions: Vec<i64>,
     pub current_version: Option<i64>,
     pub failed_version: Option<i64>,
-    pub interfaces_reloaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,12 +222,15 @@ pub struct Status {
     pub active_requests: usize,
     pub current_operation: Option<Operation>,
     pub last_operation: Option<Operation>,
-    pub pause_reason: Option<PauseReason>,
+    pub recovery: Option<Recovery>,
+    pub limits: Option<RequestLimits>,
+    pub error: Option<SqlrestError>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Registry {
     entries: Arc<Mutex<BTreeMap<String, Arc<Database>>>>,
+    workspace: Arc<Workspace>,
     shutdown: Arc<Shutdown>,
 }
 
@@ -173,23 +242,49 @@ struct Shutdown {
 }
 
 struct Database {
-    config: Configuration,
+    name: String,
+    workspace: Arc<Workspace>,
     state: Mutex<State>,
     changed: Notify,
 }
 
 struct State {
     phase: Phase,
+    config: Option<Configuration>,
+    record: Option<Record>,
+    invalid_record: bool,
     resources: Option<Resources>,
     snapshot: Option<Arc<Snapshot>>,
     active: usize,
     current: Option<Operation>,
     last: Option<Operation>,
-    registration_error: Option<SqlrestError>,
-    pause_reason: Option<PauseReason>,
+    error: Option<SqlrestError>,
 }
 
-// Field order matters: drop the database before releasing its file claim.
+impl Database {
+    fn new(name: String, workspace: Arc<Workspace>) -> Self {
+        Self {
+            name,
+            workspace,
+            state: Mutex::new(State {
+                phase: Phase::RecoveryRequired,
+                config: None,
+                record: None,
+                invalid_record: false,
+                resources: None,
+                snapshot: None,
+                active: 0,
+                current: None,
+                last: None,
+                error: None,
+            }),
+            changed: Notify::new(),
+        }
+    }
+}
+
+// Release the database before its file claim.
+#[derive(Clone)]
 struct Resources {
     executor: Executor,
     _claim: Option<Arc<FileClaim>>,
@@ -200,121 +295,115 @@ struct FileClaim {
     handle: same_file::Handle,
 }
 
-// Even independent Registry instances cannot open the same Turso file twice.
 static FILE_CLAIMS: OnceLock<Mutex<Vec<Weak<FileClaim>>>> = OnceLock::new();
-static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
 
 impl Registry {
-    pub fn new() -> Self {
-        Self::default()
+    /// Acquire the workspace and restore each persisted database independently.
+    pub async fn open(root: impl AsRef<Path>) -> Result<Self, SqlrestError> {
+        let root = root.as_ref().to_owned();
+        let workspace = Arc::new(blocking(move || Workspace::open(&root)).await?);
+        let registry = Self {
+            entries: Arc::new(Mutex::new(BTreeMap::new())),
+            workspace,
+            shutdown: Arc::new(Shutdown::default()),
+        };
+        tokio::spawn(async move {
+            let workspace = registry.workspace.clone();
+            let names = blocking(move || workspace.names()).await?;
+            for name in names {
+                let database = Arc::new(Database::new(name.clone(), registry.workspace.clone()));
+                registry
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .insert(name, database.clone());
+                if let Err(error) = restore(&database).await {
+                    let mut state = database.state.lock().unwrap();
+                    state.error = Some(error);
+                    state.phase = Phase::RecoveryRequired;
+                }
+            }
+            Ok::<_, SqlrestError>(registry)
+        })
+        .await
+        .map_err(|_| worker_failed())?
     }
 
-    /// Registration opens the database but never publishes interfaces or runs migrations.
-    /// Dropping this future does not cancel registration after it has been reserved.
-    pub async fn register(
+    /// Accept one detached publication; disconnecting never cancels accepted work.
+    pub fn publish(
         &self,
         name: &str,
-        config: Configuration,
-    ) -> Result<Status, SqlrestError> {
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
-        {
-            return Err(SqlrestError::definition(
-                "Invalid database configuration name",
-            ));
-        }
-        let config = config.normalize()?;
-        let (database, new) = {
+        request: PublishRequest,
+    ) -> Result<OperationId, SqlrestError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| worker_failed())?;
+        validate_name(name)?;
+        request.validate()?;
+        let (database, id) = {
             let mut entries = self.entries.lock().unwrap();
             self.check_open()?;
-            let existing = entries
-                .get(name)
-                .filter(|db| db.state.lock().unwrap().phase != Phase::Unregistered);
-            if let Some(existing) = existing {
-                if existing.config != config {
-                    return Err(SqlrestError::new(
-                        409,
-                        "configuration_conflict",
-                        "Database name has a different configuration",
-                    ));
-                }
-                (existing.clone(), false)
-            } else {
-                let database = Arc::new(Database {
-                    config,
-                    state: Mutex::new(State {
-                        phase: Phase::Registering,
-                        resources: None,
-                        snapshot: None,
-                        active: 0,
-                        current: None,
-                        last: None,
-                        registration_error: None,
-                        pause_reason: None,
-                    }),
-                    changed: Notify::new(),
-                });
-                entries.insert(name.into(), database.clone());
-                (database, true)
+            if !entries.contains_key(name) && request.database.is_none() {
+                return Err(SqlrestError::new(
+                    400,
+                    "database_configuration_required",
+                    "First publish requires database configuration",
+                ));
             }
+            let database = entries
+                .entry(name.into())
+                .or_insert_with(|| Arc::new(Database::new(name.into(), self.workspace.clone())))
+                .clone();
+            let mut state = database.state.lock().unwrap();
+            if state.current.is_some() {
+                return Err(busy());
+            }
+            if state.invalid_record {
+                return Err(SqlrestError::new(
+                    409,
+                    "invalid_persisted_configuration",
+                    "Repair database.toml and restart before publishing",
+                ));
+            }
+            if request.database.is_none() && state.record.is_none() {
+                return Err(SqlrestError::new(
+                    400,
+                    "database_configuration_required",
+                    "First publish requires database configuration",
+                ));
+            }
+            let id = begin(&mut state, OperationKind::Publish);
+            drop(state);
+            (database, id)
         };
-        if new {
-            let registry = self.clone();
-            let name = name.to_owned();
-            let database = database.clone();
-            tokio::spawn(async move {
-                let config = database.config.clone();
-                // A separate join boundary converts worker panics to a terminal result.
-                let result = tokio::spawn(open_resources(config))
-                    .await
-                    .unwrap_or_else(|_| Err(worker_failed()));
-                let failed = result.is_err();
-                {
-                    let mut state = database.state.lock().unwrap();
-                    match result {
-                        Ok(resources) => {
-                            state.resources = Some(resources);
-                            state.phase = Phase::Unloaded;
-                        }
-                        Err(error) => {
-                            state.registration_error = Some(error);
-                            state.phase = Phase::RegistrationFailed;
-                        }
-                    }
-                }
-                if failed {
-                    let mut entries = registry.entries.lock().unwrap();
-                    if entries
-                        .get(&name)
-                        .is_some_and(|db| Arc::ptr_eq(db, &database))
-                    {
-                        entries.remove(&name);
-                    }
-                }
-                database.changed.notify_waiters();
-            });
-        }
-        loop {
-            let changed = database.changed.notified();
-            {
-                let state = database.state.lock().unwrap();
-                if let Some(error) = &state.registration_error {
-                    return Err(error.clone());
-                }
-                if state.phase != Phase::Registering {
-                    return Ok(status(&state));
-                }
+        runtime.spawn(async move {
+            let working = database.clone();
+            let result = tokio::spawn(async move { run_publish(&working, request).await })
+                .await
+                .unwrap_or_else(|_| Err(worker_failed()));
+            let mut state = database.state.lock().unwrap();
+            if result.is_err() && state.phase == Phase::Publishing {
+                state.phase = Phase::RecoveryRequired;
             }
-            changed.await;
-        }
+            finish(&mut state, result);
+            drop(state);
+            database.changed.notify_waiters();
+        });
+        Ok(id)
     }
 
     pub fn status(&self, name: &str) -> Result<Status, SqlrestError> {
         let database = self.database(name)?;
         let state = database.state.lock().unwrap();
         Ok(status(&state))
+    }
+
+    /// Includes failed startup entries, never connection credentials.
+    pub fn statuses(&self) -> BTreeMap<String, Status> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, database)| (name.clone(), status(&database.state.lock().unwrap())))
+            .collect()
     }
 
     pub fn openapi(&self, name: &str, server_url: &str) -> Result<Value, SqlrestError> {
@@ -329,67 +418,7 @@ impl Registry {
         Ok(snapshot.openapi(server_url))
     }
 
-    /// Start a detached publication. Only the fully compiled candidate is swapped in.
-    pub fn reload(&self, name: &str) -> Result<OperationId, SqlrestError> {
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            SqlrestError::definition("Management operations require a Tokio runtime")
-        })?;
-        let (database, id) = self.start_operation(name, OperationKind::Reload)?;
-        runtime.spawn(async move {
-            let config = database.config.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Snapshot::load(&config.interfaces, config.backend()).map(Arc::new)
-            })
-            .await
-            .unwrap_or_else(|_| Err(worker_failed()));
-            let mut state = database.state.lock().unwrap();
-            let mut old_snapshot = None;
-            let result = match result {
-                Ok(snapshot) => {
-                    old_snapshot = state.snapshot.replace(snapshot);
-                    state.phase = Phase::Ready;
-                    state.pause_reason = None;
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            };
-            finish(&mut state, result);
-            drop(state);
-            database.changed.notify_waiters();
-            // A large retired schema must not be destroyed under the status lock.
-            drop(old_snapshot);
-        });
-        Ok(id)
-    }
-
-    /// Preflight before pausing; accepted migrations survive caller disconnects.
-    pub fn migrate(&self, name: &str) -> Result<OperationId, SqlrestError> {
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            SqlrestError::definition("Management operations require a Tokio runtime")
-        })?;
-        let (database, id) = self.start_operation(name, OperationKind::Migrate)?;
-        runtime.spawn(async move {
-            let working = database.clone();
-            let result = tokio::spawn(async move { run_migration(&working).await })
-                .await
-                .unwrap_or_else(|_| Err(worker_failed()));
-            let mut state = database.state.lock().unwrap();
-            if result.is_err() && state.phase == Phase::Migrating {
-                state.phase = Phase::Paused;
-                state.pause_reason = Some(PauseReason::MigrationFailed);
-                let progress = state.current.as_mut().unwrap().migration.as_mut().unwrap();
-                if progress.failed_version.is_none() {
-                    progress.failed_version = progress.current_version.take();
-                }
-            }
-            finish(&mut state, result);
-            drop(state);
-            database.changed.notify_waiters();
-        });
-        Ok(id)
-    }
-
-    /// Return durable original SQL, without writing or overwriting runtime files.
+    /// Durable original SQL, without overwriting interface/migration files.
     pub async fn export_migrations(
         &self,
         name: &str,
@@ -399,10 +428,16 @@ impl Registry {
             self.check_open()?;
             let database = lookup(&entries, name)?;
             let mut state = database.state.lock().unwrap();
-            if !matches!(state.phase, Phase::Ready | Phase::Unloaded | Phase::Paused) {
+            if state.current.is_some() || state.phase == Phase::Unregistered {
                 return Err(unavailable());
             }
-            let migrator = migrator(&database, &state);
+            let resources = state.resources.as_ref().ok_or_else(unavailable)?;
+            let config = state.config.as_ref().ok_or_else(unavailable)?;
+            let migrator = Migrator {
+                executor: resources.executor.clone(),
+                backend: config.backend(),
+                timeout: Duration::from_secs(60),
+            };
             state.active += 1;
             (
                 migrator,
@@ -412,11 +447,10 @@ impl Registry {
                 },
             )
         };
-        // Export is a read-only management task. Keep its drain lease until the
-        // executor has finished even if its caller drops this future.
         tokio::spawn(async move {
             let _lifetime = lifetime;
             let result = migrator.history().await;
+            // Release executor ownership before announcing drain completion.
             drop(migrator);
             result
         })
@@ -424,30 +458,49 @@ impl Registry {
         .map_err(|_| worker_failed())?
     }
 
-    /// Close admission immediately; completion waits for actual request cleanup.
+    /// Delete only the registration, after draining actual request cleanup.
     pub fn unregister(&self, name: &str) -> Result<OperationId, SqlrestError> {
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            SqlrestError::definition("Management operations require a Tokio runtime")
-        })?;
-        let (database, id) = self.start_operation(name, OperationKind::Unregister)?;
-        runtime.spawn(async move {
-            loop {
-                let changed = database.changed.notified();
-                if database.state.lock().unwrap().active == 0 {
-                    break;
-                }
-                changed.await;
-            }
-            let (resources, snapshot) = {
-                let mut state = database.state.lock().unwrap();
-                (state.resources.take(), state.snapshot.take())
-            };
-            let result = tokio::task::spawn_blocking(move || drop((resources, snapshot)))
-                .await
-                .map_err(|_| worker_failed());
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| worker_failed())?;
+        let (database, id) = {
+            let entries = self.entries.lock().unwrap();
+            self.check_open()?;
+            let database = lookup(&entries, name)?;
             let mut state = database.state.lock().unwrap();
-            state.phase = Phase::Unregistered;
-            state.pause_reason = None;
+            if state.current.is_some() {
+                return Err(busy());
+            }
+            let id = begin(&mut state, OperationKind::Unregister);
+            state.phase = Phase::Unregistering;
+            drop(state);
+            (database, id)
+        };
+        runtime.spawn(async move {
+            let working = database.clone();
+            let result = tokio::spawn(async move {
+                drain(&working).await;
+                let db = working.clone();
+                blocking(move || db.workspace.remove(&db.name)).await?;
+                let retired = {
+                    let mut state = working.state.lock().unwrap();
+                    state.record = None;
+                    state.config = None;
+                    state.invalid_record = false;
+                    (state.resources.take(), state.snapshot.take())
+                };
+                blocking(move || {
+                    drop(retired);
+                    Ok(())
+                })
+                .await
+            })
+            .await
+            .unwrap_or_else(|_| Err(worker_failed()));
+            let mut state = database.state.lock().unwrap();
+            state.phase = if result.is_ok() {
+                Phase::Unregistered
+            } else {
+                Phase::RecoveryRequired
+            };
             finish(&mut state, result);
             drop(state);
             database.changed.notify_waiters();
@@ -455,14 +508,12 @@ impl Registry {
         Ok(id)
     }
 
-    /// Only current and most recent results are retained, including after unregister.
     pub fn operation(&self, name: &str, id: OperationId) -> Result<Operation, SqlrestError> {
         let database = self.database(name)?;
         let state = database.state.lock().unwrap();
         operation(&state, id)
     }
 
-    /// Waiting is optional; dropping this future never cancels the operation.
     pub async fn wait_operation(
         &self,
         name: &str,
@@ -482,7 +533,6 @@ impl Registry {
         }
     }
 
-    /// Segments must already be percent-decoded once by the transport.
     pub async fn execute(
         &self,
         name: &str,
@@ -501,23 +551,21 @@ impl Registry {
         method: &str,
         segments: &[&str],
     ) -> Result<AdmittedRequest, SqlrestError> {
-        let (executor, matched, lifetime, limits) = {
-            let entries = self.entries.lock().unwrap();
-            self.check_open()?;
-            let database = lookup(&entries, name)?;
-            let mut state = database.state.lock().unwrap();
-            if state.phase != Phase::Ready {
-                return Err(unavailable());
-            }
-            let snapshot = state.snapshot.as_ref().unwrap().clone();
-            let matched = snapshot.resolve(method, segments)?;
-            let executor = state.resources.as_ref().unwrap().executor.clone();
-            state.active += 1;
-            let lifetime = RequestLifetime {
-                database: database.clone(),
-                _snapshot: Some(snapshot),
-            };
-            (executor, matched, lifetime, database.config.limits)
+        let entries = self.entries.lock().unwrap();
+        self.check_open()?;
+        let database = lookup(&entries, name)?;
+        let mut state = database.state.lock().unwrap();
+        if state.phase != Phase::Ready {
+            return Err(unavailable());
+        }
+        let snapshot = state.snapshot.as_ref().unwrap().clone();
+        let matched = snapshot.resolve(method, segments)?;
+        let executor = state.resources.as_ref().unwrap().executor.clone();
+        let limits = state.config.as_ref().unwrap().limits;
+        state.active += 1;
+        let lifetime = RequestLifetime {
+            database: database.clone(),
+            _snapshot: Some(snapshot),
         };
         Ok(AdmittedRequest {
             executor,
@@ -531,8 +579,7 @@ impl Registry {
         self.shutdown.closed.load(Ordering::Acquire)
     }
 
-    /// Permanently close admission, finish accepted work, and release resources.
-    /// Once started, dropping this waiter does not cancel shutdown.
+    /// Drain accepted work without changing persisted registrations.
     pub async fn shutdown(&self) -> Result<(), SqlrestError> {
         self.start_shutdown()?;
         loop {
@@ -545,8 +592,7 @@ impl Registry {
     }
 
     pub(crate) fn start_shutdown(&self) -> Result<(), SqlrestError> {
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| SqlrestError::definition("Shutdown requires a Tokio runtime"))?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| worker_failed())?;
         let databases = {
             let entries = self.entries.lock().unwrap();
             if self.shutdown.closed.swap(true, Ordering::AcqRel) {
@@ -557,39 +603,30 @@ impl Registry {
         let shutdown = self.shutdown.clone();
         runtime.spawn(async move {
             let result = tokio::spawn(async move {
-                let mut failure = None;
                 for database in databases {
                     loop {
                         let changed = database.changed.notified();
                         {
                             let state = database.state.lock().unwrap();
-                            if state.phase != Phase::Registering
-                                && state.current.is_none()
-                                && state.active == 0
-                            {
+                            if state.current.is_none() && state.active == 0 {
                                 break;
                             }
                         }
                         changed.await;
                     }
-                    let resources = {
+                    let retired = {
                         let mut state = database.state.lock().unwrap();
-                        state.phase = Phase::Unregistering;
+                        state.phase = Phase::Unregistered;
                         (state.resources.take(), state.snapshot.take())
                     };
-                    if tokio::task::spawn_blocking(move || drop(resources))
-                        .await
-                        .is_err()
-                    {
-                        failure = Some(worker_failed());
-                    }
-                    let mut state = database.state.lock().unwrap();
-                    state.phase = Phase::Unregistered;
-                    state.pause_reason = None;
-                    drop(state);
+                    blocking(move || {
+                        drop(retired);
+                        Ok(())
+                    })
+                    .await?;
                     database.changed.notify_waiters();
                 }
-                failure.map_or(Ok(()), Err)
+                Ok::<_, SqlrestError>(())
             })
             .await
             .unwrap_or_else(|_| Err(worker_failed()));
@@ -607,24 +644,361 @@ impl Registry {
         }
     }
 
-    fn start_operation(
-        &self,
-        name: &str,
-        kind: OperationKind,
-    ) -> Result<(Arc<Database>, OperationId), SqlrestError> {
-        let entries = self.entries.lock().unwrap();
-        self.check_open()?;
-        let database = lookup(&entries, name)?;
-        let id = begin(&database, kind)?;
-        Ok((database, id))
-    }
-
     fn database(&self, name: &str) -> Result<Arc<Database>, SqlrestError> {
         lookup(&self.entries.lock().unwrap(), name)
     }
 }
 
-// Release executor ownership before the drain lease when an upload/parse fails.
+async fn restore(database: &Arc<Database>) -> Result<(), SqlrestError> {
+    let db = database.clone();
+    let record = match blocking(move || db.workspace.read(&db.name)).await {
+        Ok(record) => record,
+        Err(error) => {
+            database.state.lock().unwrap().invalid_record = true;
+            return Err(error);
+        }
+    };
+    let config = Configuration::from_record(&database.workspace, &database.name, &record)?;
+    {
+        let mut state = database.state.lock().unwrap();
+        state.record = Some(record.clone());
+        state.config = Some(config.clone());
+    }
+    let db = database.clone();
+    let turso = matches!(config.target, Target::Turso(_));
+    blocking(move || {
+        db.workspace.validate_layout(&db.name)?;
+        if turso {
+            db.workspace.require_data(&db.name)?;
+        }
+        Ok(())
+    })
+    .await?;
+    let resources = open_resources(config.clone(), false).await?;
+    database.state.lock().unwrap().resources = Some(resources);
+    if record.state.recovery == Recovery::None {
+        let snapshot =
+            blocking(move || Snapshot::load(&config.interfaces, config.backend()).map(Arc::new))
+                .await?;
+        let mut state = database.state.lock().unwrap();
+        state.snapshot = Some(snapshot);
+        state.phase = Phase::Ready;
+    }
+    Ok(())
+}
+
+async fn run_publish(
+    database: &Arc<Database>,
+    request: PublishRequest,
+) -> Result<(), SqlrestError> {
+    let (old_record, old_config, old_resources) = {
+        let state = database.state.lock().unwrap();
+        (
+            state.record.clone(),
+            state.config.clone(),
+            state.resources.clone(),
+        )
+    };
+    let mut candidate = Record {
+        database: request
+            .database
+            .or_else(|| old_record.as_ref().map(|r| r.database.clone()))
+            .ok_or_else(|| SqlrestError::definition("Database configuration required"))?,
+        state: PersistentState {
+            recovery: Recovery::Reload,
+        },
+        limits: request.limits,
+    };
+    let config = Configuration::from_record(&database.workspace, &database.name, &candidate)?;
+    let same_target = old_config
+        .as_ref()
+        .is_some_and(|old| old.target == config.target);
+    let db = database.clone();
+    let must_exist = old_record
+        .as_ref()
+        .is_some_and(|r| r.database == DatabaseConfig::Turso {})
+        && candidate.database == DatabaseConfig::Turso {};
+    blocking(move || {
+        if must_exist {
+            db.workspace.require_data(&db.name)?;
+        }
+        db.workspace.prepare(&db.name)
+    })
+    .await?;
+    let resources = if same_target {
+        match old_resources {
+            Some(resources) => resources,
+            None => open_resources(config.clone(), !must_exist).await?,
+        }
+    } else {
+        open_resources(config.clone(), !must_exist).await?
+    };
+
+    // Changed target: close/drain, then durably adopt before touching its schema.
+    if !same_target || old_record.is_none() {
+        let previous_phase = close_admission(database);
+        drain(database).await;
+        let db = database.clone();
+        let turso = matches!(config.target, Target::Turso(_));
+        blocking(move || {
+            if turso {
+                db.workspace.sync_data(&db.name)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| restore_admission(database, previous_phase, error))?;
+        persist(database, candidate.clone())
+            .await
+            .map_err(|error| restore_admission(database, previous_phase, error))?;
+        let retired = {
+            let mut state = database.state.lock().unwrap();
+            state.config = Some(config.clone());
+            state.record = Some(candidate.clone());
+            (
+                state.resources.replace(resources.clone()),
+                state.snapshot.take(),
+            )
+        };
+        blocking(move || {
+            drop(retired);
+            Ok(())
+        })
+        .await?;
+    } else {
+        database.state.lock().unwrap().resources = Some(resources.clone());
+    }
+
+    progress(database, |p| p.step = PublishStep::Preflight);
+    let root = config.migrations.clone();
+    let backend = config.backend();
+    let plan = blocking(move || Plan::load(&root, backend)).await?;
+    let timeout = duration(request.migration_timeout_ms)?;
+    let mut migrator = Migrator {
+        executor: resources.executor.clone(),
+        backend,
+        timeout,
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    let history = migrator.history().await?;
+    let (pending, expected_history) =
+        blocking(move || Ok((plan.into_pending(&history)?, history))).await?;
+    let recovering_migration = database
+        .state
+        .lock()
+        .unwrap()
+        .record
+        .as_ref()
+        .is_some_and(|r| r.state.recovery == Recovery::Migration);
+    if !pending.is_empty() || recovering_migration {
+        let budget = remaining(deadline)?;
+        let previous_phase = close_admission(database);
+        drain(database).await;
+        // Preserve effective limits until the candidate interfaces succeed.
+        let mut blocked = database.state.lock().unwrap().record.clone().unwrap();
+        blocked.state.recovery = Recovery::Migration;
+        persist(database, blocked.clone())
+            .await
+            .map_err(|error| restore_admission(database, previous_phase, error))?;
+        database.state.lock().unwrap().record = Some(blocked.clone());
+        // Draining existing requests and persisting the blocker do not consume
+        // the remaining migration budget. Never reset it per file.
+        let deadline = tokio::time::Instant::now() + budget;
+        migrator.timeout = remaining(deadline)?;
+        let history = migrator.history().await?;
+        if history != expected_history {
+            return Err(SqlrestError::new(
+                409,
+                "migration_history_changed",
+                "Migration history changed during publication; retry publish",
+            ));
+        }
+        for file in pending {
+            let version = file.record.version;
+            progress(database, |p| {
+                p.step = PublishStep::Applying;
+                p.current_version = Some(version);
+            });
+            migrator.timeout = remaining(deadline).inspect_err(|_| {
+                progress(database, |p| {
+                    p.failed_version = Some(version);
+                    p.current_version = None;
+                });
+            })?;
+            if let Err(error) = migrator.apply(file).await {
+                progress(database, |p| {
+                    p.failed_version = Some(version);
+                    p.current_version = None;
+                });
+                return Err(error);
+            }
+            progress(database, |p| {
+                p.applied_versions.push(version);
+                p.current_version = None;
+            });
+        }
+        blocked.state.recovery = Recovery::Reload;
+        persist(database, blocked.clone()).await?;
+        database.state.lock().unwrap().record = Some(blocked);
+    }
+    progress(database, |p| p.step = PublishStep::Loading);
+    let root = config.interfaces.clone();
+    let snapshot = blocking(move || Snapshot::load(&root, backend).map(Arc::new)).await?;
+    candidate.state.recovery = Recovery::None;
+    persist(database, candidate.clone()).await?;
+    let retired = {
+        let mut state = database.state.lock().unwrap();
+        state.record = Some(candidate);
+        state.config = Some(config);
+        state.resources = Some(resources);
+        state.phase = Phase::Ready;
+        state.error = None;
+        let old = state.snapshot.replace(snapshot);
+        state
+            .current
+            .as_mut()
+            .unwrap()
+            .publish
+            .as_mut()
+            .unwrap()
+            .step = PublishStep::Complete;
+        old
+    };
+    blocking(move || {
+        drop(retired);
+        Ok(())
+    })
+    .await
+}
+
+fn remaining(deadline: tokio::time::Instant) -> Result<Duration, SqlrestError> {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(crate::turso_driver::timeout)
+}
+
+async fn persist(database: &Arc<Database>, record: Record) -> Result<(), SqlrestError> {
+    let db = database.clone();
+    let result = blocking(move || db.workspace.persist(&db.name, &record)).await;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.code == "workspace_commit_uncertain")
+    {
+        // rename may precede a failed directory sync. Do not claim rollback.
+        let mut state = database.state.lock().unwrap();
+        state.phase = Phase::RecoveryRequired;
+        // Reload the authoritative file on restart before using either target.
+        state.invalid_record = true;
+    }
+    result
+}
+
+fn close_admission(database: &Database) -> Phase {
+    let mut state = database.state.lock().unwrap();
+    let previous_phase = state.phase;
+    state.phase = Phase::Publishing;
+    state
+        .current
+        .as_mut()
+        .unwrap()
+        .publish
+        .as_mut()
+        .unwrap()
+        .step = PublishStep::Draining;
+    previous_phase
+}
+
+// Only used before adopting a new target or mutating its schema. A definite
+// persistence failure leaves the old service intact; an uncertain commit does not.
+fn restore_admission(
+    database: &Database,
+    previous_phase: Phase,
+    error: SqlrestError,
+) -> SqlrestError {
+    let mut state = database.state.lock().unwrap();
+    if !state.invalid_record && state.phase == Phase::Publishing {
+        state.phase = previous_phase;
+    }
+    error
+}
+
+async fn drain(database: &Database) {
+    loop {
+        let changed = database.changed.notified();
+        if database.state.lock().unwrap().active == 0 {
+            return;
+        }
+        changed.await;
+    }
+}
+
+fn progress(database: &Database, update: impl FnOnce(&mut PublishProgress)) {
+    let mut state = database.state.lock().unwrap();
+    update(state.current.as_mut().unwrap().publish.as_mut().unwrap());
+}
+
+fn begin(state: &mut State, kind: OperationKind) -> OperationId {
+    let id = OperationId::new(kind);
+    state.current = Some(Operation {
+        id,
+        kind,
+        outcome: Outcome::Running,
+        error: None,
+        publish: (kind == OperationKind::Publish).then_some(PublishProgress {
+            step: PublishStep::Connecting,
+            applied_versions: Vec::new(),
+            current_version: None,
+            failed_version: None,
+        }),
+    });
+    id
+}
+
+fn finish(state: &mut State, result: Result<(), SqlrestError>) {
+    let mut operation = state
+        .current
+        .take()
+        .expect("operation owns management slot");
+    operation.outcome = if result.is_ok() {
+        Outcome::Succeeded
+    } else {
+        Outcome::Failed
+    };
+    operation.error = result.err();
+    state.error = operation.error.clone();
+    state.last = Some(operation);
+}
+
+fn operation(state: &State, id: OperationId) -> Result<Operation, SqlrestError> {
+    state
+        .current
+        .iter()
+        .chain(state.last.iter())
+        .find(|op| op.id == id)
+        .cloned()
+        .ok_or_else(|| {
+            SqlrestError::new(
+                404,
+                "operation_not_found",
+                "Operation record is unavailable; inspect database state before retrying",
+            )
+        })
+}
+
+fn status(state: &State) -> Status {
+    Status {
+        phase: state.phase,
+        version: state.snapshot.as_ref().map(|s| s.version().into()),
+        active_requests: state.active,
+        current_operation: state.current.clone(),
+        last_operation: state.last.clone(),
+        recovery: state.record.as_ref().map(|r| r.state.recovery),
+        limits: state.record.as_ref().map(|r| r.limits),
+        error: state.error.clone(),
+    }
+}
+
 pub(crate) struct AdmittedRequest {
     executor: Executor,
     matched: MatchedEndpoint,
@@ -636,7 +1010,7 @@ impl AdmittedRequest {
     pub async fn execute(
         self,
         mut input: Input,
-        remaining: Option<std::time::Duration>,
+        remaining: Option<Duration>,
     ) -> Result<Vec<u8>, SqlrestError> {
         let Self {
             executor,
@@ -651,6 +1025,18 @@ impl AdmittedRequest {
         executor
             .execute_tracked(matched.endpoint, input, limits, lifetime)
             .await
+    }
+}
+
+struct RequestLifetime {
+    database: Arc<Database>,
+    _snapshot: Option<Arc<Snapshot>>,
+}
+
+impl Drop for RequestLifetime {
+    fn drop(&mut self) {
+        self.database.state.lock().unwrap().active -= 1;
+        self.database.changed.notify_waiters();
     }
 }
 
@@ -671,246 +1057,69 @@ pub(crate) fn shutting_down() -> SqlrestError {
     SqlrestError::new(503, "server_shutting_down", "Server is shutting down")
 }
 
-struct RequestLifetime {
-    database: Arc<Database>,
-    _snapshot: Option<Arc<Snapshot>>,
+fn unavailable() -> SqlrestError {
+    SqlrestError::new(
+        503,
+        "database_unavailable",
+        "Database interfaces are not accepting requests",
+    )
 }
 
-impl Drop for RequestLifetime {
-    fn drop(&mut self) {
-        self.database.state.lock().unwrap().active -= 1;
-        self.database.changed.notify_waiters();
-    }
+fn busy() -> SqlrestError {
+    SqlrestError::new(
+        409,
+        "operation_in_progress",
+        "A database operation is in progress",
+    )
 }
 
-fn begin(database: &Database, kind: OperationKind) -> Result<OperationId, SqlrestError> {
-    let mut state = database.state.lock().unwrap();
-    if state.current.is_some() || state.phase == Phase::Registering {
-        return Err(SqlrestError::new(
-            409,
-            "operation_in_progress",
-            "A database operation is in progress",
-        ));
-    }
-    if matches!(state.phase, Phase::Unregistered | Phase::RegistrationFailed) {
-        return Err(SqlrestError::new(
-            404,
-            "database_not_found",
-            "Database configuration is not registered",
-        ));
-    }
-    if kind == OperationKind::Reload && state.pause_reason == Some(PauseReason::MigrationFailed) {
-        return Err(SqlrestError::new(
-            409,
-            "migration_recovery_required",
-            "Retry migrate successfully before reloading interfaces",
-        ));
-    }
-    let id = NEXT_OPERATION
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .map(OperationId)
-        .map_err(|_| worker_failed())?;
-    state.current = Some(Operation {
-        id,
-        kind,
-        outcome: Outcome::Running,
-        error: None,
-        migration: (kind == OperationKind::Migrate).then_some(MigrationProgress {
-            step: MigrationStep::Preflight,
-            applied_versions: Vec::new(),
-            current_version: None,
-            failed_version: None,
-            interfaces_reloaded: false,
-        }),
-    });
-    if kind == OperationKind::Unregister {
-        state.phase = Phase::Unregistering;
-    }
-    Ok(id)
+fn worker_failed() -> SqlrestError {
+    SqlrestError::new(
+        500,
+        "management_task_failed",
+        "Database management worker failed",
+    )
 }
 
-fn finish(state: &mut State, result: Result<(), SqlrestError>) {
-    let mut operation = state
-        .current
-        .take()
-        .expect("operation owns management slot");
-    operation.outcome = if result.is_ok() {
-        Outcome::Succeeded
-    } else {
-        Outcome::Failed
-    };
-    operation.error = result.err();
-    state.last = Some(operation);
-}
-
-fn operation(state: &State, id: OperationId) -> Result<Operation, SqlrestError> {
-    state
-        .current
-        .iter()
-        .chain(state.last.iter())
-        .find(|op| op.id == id)
-        .cloned()
-        .ok_or_else(|| {
-            SqlrestError::new(
-                404,
-                "operation_not_found",
-                "Operation result is no longer retained",
-            )
-        })
-}
-
-fn status(state: &State) -> Status {
-    Status {
-        phase: state.phase,
-        version: state.snapshot.as_ref().map(|s| s.version().into()),
-        active_requests: state.active,
-        current_operation: state.current.clone(),
-        last_operation: state.last.clone(),
-        pause_reason: state.pause_reason,
-    }
-}
-
-fn migrator(database: &Database, state: &State) -> Migrator {
-    Migrator {
-        executor: state
-            .resources
-            .as_ref()
-            .expect("registered resources")
-            .executor
-            .clone(),
-        backend: database.config.backend(),
-        timeout: database.config.limits.timeout,
-    }
-}
-
-fn progress(database: &Database, update: impl FnOnce(&mut MigrationProgress)) {
-    let mut state = database.state.lock().unwrap();
-    update(state.current.as_mut().unwrap().migration.as_mut().unwrap());
-}
-
-async fn run_migration(database: &Database) -> Result<(), SqlrestError> {
-    let root = database.config.migrations.clone();
-    let backend = database.config.backend();
-    let plan = tokio::task::spawn_blocking(move || Plan::load(&root, backend))
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, SqlrestError> + Send + 'static,
+) -> Result<T, SqlrestError> {
+    tokio::task::spawn_blocking(work)
         .await
-        .map_err(|_| worker_failed())??;
-    let migrator = migrator(database, &database.state.lock().unwrap());
-    let history = migrator.history().await?;
-    let plan = tokio::task::spawn_blocking(move || {
-        plan.validate(&history)?;
-        Ok::<_, SqlrestError>(plan)
-    })
-    .await
-    .map_err(|_| worker_failed())??;
-    let published = {
-        let mut state = database.state.lock().unwrap();
-        let published = state.snapshot.is_some();
-        state.phase = Phase::Migrating;
-        state
-            .current
-            .as_mut()
-            .unwrap()
-            .migration
-            .as_mut()
-            .unwrap()
-            .step = MigrationStep::Draining;
-        published
-    };
-    loop {
-        let changed = database.changed.notified();
-        if database.state.lock().unwrap().active == 0 {
-            break;
-        }
-        changed.await;
-    }
-    // Recheck history after drain, but never re-read the deployed files.
-    let history = migrator.history().await?;
-    let pending = tokio::task::spawn_blocking(move || plan.into_pending(&history))
-        .await
-        .map_err(|_| worker_failed())??;
-    for file in pending {
-        let version = file.record.version;
-        progress(database, |p| {
-            p.step = MigrationStep::Applying;
-            p.current_version = Some(version);
-        });
-        if let Err(error) = migrator.apply(file).await {
-            progress(database, |p| {
-                p.failed_version = Some(version);
-                p.current_version = None;
-            });
-            return Err(error);
-        }
-        progress(database, |p| {
-            p.applied_versions.push(version);
-            p.current_version = None;
-        });
-    }
-    let snapshot = if published {
-        progress(database, |p| p.step = MigrationStep::Reloading);
-        let root = database.config.interfaces.clone();
-        match tokio::task::spawn_blocking(move || Snapshot::load(&root, backend).map(Arc::new))
-            .await
-            .unwrap_or_else(|_| Err(worker_failed()))
-        {
-            Ok(snapshot) => Some(snapshot),
-            Err(_) => {
-                let mut state = database.state.lock().unwrap();
-                state.phase = Phase::Paused;
-                state.pause_reason = Some(PauseReason::ReloadFailed);
-                return Err(SqlrestError::new(
-                    500,
-                    "migration_reload_failed",
-                    "Migrations are committed but interface reload failed; fix interfaces and reload",
-                ));
-            }
-        }
-    } else {
-        None
-    };
-    let mut state = database.state.lock().unwrap();
-    let old = std::mem::replace(&mut state.snapshot, snapshot);
-    state.phase = if published {
-        Phase::Ready
-    } else {
-        Phase::Unloaded
-    };
-    state.pause_reason = None;
-    let progress = state.current.as_mut().unwrap().migration.as_mut().unwrap();
-    progress.step = MigrationStep::Complete;
-    progress.interfaces_reloaded = published;
-    drop(state);
-    drop(old);
-    Ok(())
+        .map_err(|_| worker_failed())?
 }
 
-async fn open_resources(config: Configuration) -> Result<Resources, SqlrestError> {
-    let timeout = config.limits.timeout;
+async fn open_resources(
+    config: Configuration,
+    allow_create: bool,
+) -> Result<Resources, SqlrestError> {
     match config.target {
-        Target::Turso(path) => tokio::task::spawn_blocking(move || {
-            let claim = claim_file(&path)?;
-            let database = crate::turso_driver::open(&claim.path)?;
-            // Runtime owns file stability; detect replacement during opening.
-            let after = same_file::Handle::from_path(&claim.path).map_err(|_| file_error())?;
-            if after != claim.handle {
-                return Err(file_error());
-            }
-            Ok(Resources {
-                executor: Executor::turso(database),
-                _claim: Some(claim),
+        Target::Turso(path) => {
+            blocking(move || {
+                let claim = claim_file(&path, allow_create)?;
+                let database = crate::turso_driver::open(&claim.path)?;
+                let after = same_file::Handle::from_path(&claim.path).map_err(|_| file_error())?;
+                if after != claim.handle {
+                    return Err(file_error());
+                }
+                Ok(Resources {
+                    executor: Executor::turso(database),
+                    _claim: Some(claim),
+                })
             })
-        })
-        .await
-        .unwrap_or_else(|_| Err(worker_failed())),
+            .await
+        }
         Target::PostgresUnencrypted(config) => {
-            let (client, connection) =
-                tokio::time::timeout(timeout, config.connect(tokio_postgres::NoTls))
-                    .await
-                    .map_err(|_| crate::turso_driver::timeout())?
-                    .map_err(|error| {
-                        SqlrestError::new(500, "database_error", "Cannot connect to database")
-                            .with_diagnostic("postgres", error)
-                    })?;
+            let (client, connection) = tokio::time::timeout(
+                Duration::from_secs(5),
+                config.connect(tokio_postgres::NoTls),
+            )
+            .await
+            .map_err(|_| crate::turso_driver::timeout())?
+            .map_err(|error| {
+                SqlrestError::new(500, "database_error", "Cannot connect to database")
+                    .with_diagnostic("postgres", error)
+            })?;
             drop(client);
             drop(connection);
             Ok(Resources {
@@ -921,10 +1130,11 @@ async fn open_resources(config: Configuration) -> Result<Resources, SqlrestError
     }
 }
 
-fn claim_file(path: &Path) -> Result<Arc<FileClaim>, SqlrestError> {
-    let claims = FILE_CLAIMS.get_or_init(|| Mutex::new(Vec::new()));
-    // Serialize only identity reservation/creation, never database opening or SQL.
-    let mut claims = claims.lock().unwrap();
+fn claim_file(path: &Path, allow_create: bool) -> Result<Arc<FileClaim>, SqlrestError> {
+    let mut claims = FILE_CLAIMS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
     claims.retain(|claim| claim.strong_count() != 0);
     if let Ok(metadata) = fs::metadata(path)
         && !metadata.is_file()
@@ -934,7 +1144,7 @@ fn claim_file(path: &Path) -> Result<Arc<FileClaim>, SqlrestError> {
     let file = match OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true)
+        .create_new(allow_create)
         .open(path)
     {
         Ok(file) => file,
@@ -966,23 +1176,6 @@ fn claim_file(path: &Path) -> Result<Arc<FileClaim>, SqlrestError> {
     Ok(claim)
 }
 
-fn absolute(path: &Path) -> Result<PathBuf, SqlrestError> {
-    if path.as_os_str().is_empty() {
-        return Err(SqlrestError::definition(
-            "Configuration paths cannot be empty",
-        ));
-    }
-    std::path::absolute(path).map_err(|_| file_error())
-}
-
-fn unavailable() -> SqlrestError {
-    SqlrestError::new(
-        503,
-        "database_unavailable",
-        "Database interfaces are not accepting requests",
-    )
-}
-
 fn file_error() -> SqlrestError {
     SqlrestError::new(
         400,
@@ -991,10 +1184,301 @@ fn file_error() -> SqlrestError {
     )
 }
 
-fn worker_failed() -> SqlrestError {
-    SqlrestError::new(
-        500,
-        "management_task_failed",
-        "Database management worker failed",
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::{PersistFault, RemoveFault};
+
+    async fn fixture() -> (tempfile::TempDir, Registry, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("databases/app");
+        fs::create_dir_all(root.join("interfaces")).unwrap();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::write(root.join("interfaces/get.sql"), "SELECT 'old' AS value").unwrap();
+        fs::write(root.join("interfaces/get.response.yaml"),
+            r#"{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#).unwrap();
+        let registry = Registry::open(directory.path()).await.unwrap();
+        let id = registry
+            .publish(
+                "app",
+                PublishRequest {
+                    database: Some(DatabaseConfig::Turso {}),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.wait_operation("app", id).await.unwrap().outcome,
+            Outcome::Succeeded
+        );
+        (directory, registry, root)
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_keeps_old_snapshot_and_limits() {
+        let (_directory, registry, root) = fixture().await;
+        let original = fs::read(root.join("database.toml")).unwrap();
+        let version = registry.status("app").unwrap().version;
+        fs::write(root.join("interfaces/get.sql"), "SELECT 'new' AS value").unwrap();
+        *registry.workspace.persist_fault.lock().unwrap() = Some(PersistFault::BeforeReplace);
+        let id = registry
+            .publish(
+                "app",
+                PublishRequest {
+                    limits: RequestLimits {
+                        max_rows: 2,
+                        request_timeout_ms: 15,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.wait_operation("app", id).await.unwrap().outcome,
+            Outcome::Failed
+        );
+        let state = registry.status("app").unwrap();
+        assert_eq!(state.phase, Phase::Ready);
+        assert_eq!(state.version, version);
+        assert_eq!(state.limits, Some(RequestLimits::default()));
+        assert_eq!(fs::read(root.join("database.toml")).unwrap(), original);
+        let result = registry
+            .execute("app", "get", &[], Input::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result).unwrap()["records"][0]["value"],
+            "old"
+        );
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_blocker_persistence_prevents_database_mutation() {
+        let (_directory, registry, root) = fixture().await;
+        let original = fs::read(root.join("database.toml")).unwrap();
+        let version = registry.status("app").unwrap().version;
+        fs::write(root.join("interfaces/get.sql"), "SELECT 'new' AS value").unwrap();
+        fs::write(
+            root.join("migrations/0001_new.sql"),
+            "CREATE TABLE new_table(id BIGINT)",
+        )
+        .unwrap();
+        *registry.workspace.persist_fault.lock().unwrap() = Some(PersistFault::BeforeReplace);
+        let id = registry
+            .publish(
+                "app",
+                PublishRequest {
+                    limits: RequestLimits {
+                        max_rows: 2,
+                        request_timeout_ms: 15,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.wait_operation("app", id).await.unwrap().outcome,
+            Outcome::Failed
+        );
+        let state = registry.status("app").unwrap();
+        assert_eq!(state.phase, Phase::Ready);
+        assert_eq!(state.version, version);
+        assert_eq!(state.limits, Some(RequestLimits::default()));
+        assert_eq!(fs::read(root.join("database.toml")).unwrap(), original);
+        let result = registry
+            .execute("app", "get", &[], Input::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result).unwrap()["records"][0]["value"],
+            "old"
+        );
+        assert!(registry.export_migrations("app").await.unwrap().is_empty());
+        // Successful CREATE TABLE proves the failed publish never ran that DDL.
+        let id = registry.publish("app", PublishRequest::default()).unwrap();
+        assert_eq!(
+            registry.wait_operation("app", id).await.unwrap().outcome,
+            Outcome::Succeeded
+        );
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unregister_persistence_failures_close_admission_and_allow_retry() {
+        for fault in [RemoveFault::BeforeRemove, RemoveFault::AfterRemove] {
+            let (_directory, registry, root) = fixture().await;
+            let source = fs::read(root.join("interfaces/get.sql")).unwrap();
+            *registry.workspace.remove_fault.lock().unwrap() = Some(fault);
+            let id = registry.unregister("app").unwrap();
+            let operation = registry.wait_operation("app", id).await.unwrap();
+            assert_eq!(operation.outcome, Outcome::Failed);
+            assert!(operation.error.is_some());
+            assert_eq!(
+                registry.status("app").unwrap().phase,
+                Phase::RecoveryRequired
+            );
+            assert!(
+                registry
+                    .execute("app", "get", &[], Input::default())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                root.join("database.toml").exists(),
+                fault == RemoveFault::BeforeRemove
+            );
+            assert!(root.join("data.db").is_file());
+            assert_eq!(fs::read(root.join("interfaces/get.sql")).unwrap(), source);
+
+            let id = registry.unregister("app").unwrap();
+            assert_eq!(
+                registry.wait_operation("app", id).await.unwrap().outcome,
+                Outcome::Succeeded
+            );
+            assert_eq!(registry.status("app").unwrap().phase, Phase::Unregistered);
+            assert!(!root.join("database.toml").exists());
+            assert!(root.join("data.db").is_file());
+            assert_eq!(fs::read(root.join("interfaces/get.sql")).unwrap(), source);
+            registry.shutdown().await.unwrap();
+        }
+    }
+
+    mod postgres_tests {
+        use super::*;
+
+        #[tokio::test]
+        #[ignore = "requires disposable SQLREST_TEST_POSTGRES"]
+        async fn target_adoption_persistence_failures_preserve_or_block_old_service() {
+            let connection = std::env::var("SQLREST_TEST_POSTGRES").unwrap();
+            let (directory, registry, root) = fixture().await;
+            let original = fs::read(root.join("database.toml")).unwrap();
+            let version = registry.status("app").unwrap().version;
+            fs::write(root.join("interfaces/get.sql"), "SELECT 'new' AS value").unwrap();
+            let request = PublishRequest {
+                database: Some(DatabaseConfig::PostgresUnencrypted { connection }),
+                limits: RequestLimits {
+                    max_rows: 2,
+                    request_timeout_ms: 5000,
+                },
+                ..Default::default()
+            };
+            *registry.workspace.persist_fault.lock().unwrap() = Some(PersistFault::BeforeReplace);
+            let id = registry.publish("app", request.clone()).unwrap();
+            assert_eq!(
+                registry.wait_operation("app", id).await.unwrap().outcome,
+                Outcome::Failed
+            );
+            let state = registry.status("app").unwrap();
+            assert_eq!(state.phase, Phase::Ready);
+            assert_eq!(state.version, version);
+            assert_eq!(state.limits, Some(RequestLimits::default()));
+            assert_eq!(fs::read(root.join("database.toml")).unwrap(), original);
+            let result = registry
+                .execute("app", "get", &[], Input::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&result).unwrap()["records"][0]["value"],
+                "old"
+            );
+
+            *registry.workspace.persist_fault.lock().unwrap() = Some(PersistFault::AfterReplace);
+            let id = registry.publish("app", request).unwrap();
+            let operation = registry.wait_operation("app", id).await.unwrap();
+            assert_eq!(operation.error.unwrap().code, "workspace_commit_uncertain");
+            assert_eq!(
+                registry.status("app").unwrap().phase,
+                Phase::RecoveryRequired
+            );
+            assert!(
+                registry
+                    .execute("app", "get", &[], Input::default())
+                    .await
+                    .is_err()
+            );
+            assert!(registry.publish("app", PublishRequest::default()).is_err());
+            registry.shutdown().await.unwrap();
+            drop(registry);
+
+            let registry = Registry::open(directory.path()).await.unwrap();
+            let database = registry.database("app").unwrap();
+            {
+                let state = database.state.lock().unwrap();
+                assert!(matches!(
+                    state.config.as_ref().unwrap().target,
+                    Target::PostgresUnencrypted(_)
+                ));
+                assert_eq!(state.phase, Phase::RecoveryRequired);
+                assert_eq!(
+                    state.record.as_ref().unwrap().state.recovery,
+                    Recovery::Reload
+                );
+                assert_eq!(state.record.as_ref().unwrap().limits.max_rows, 2);
+            }
+            assert!(root.join("data.db").exists());
+            registry.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_config_commit_requires_restart_and_never_reports_success() {
+        let (directory, registry, root) = fixture().await;
+        fs::write(root.join("interfaces/get.sql"), "SELECT 'new' AS value").unwrap();
+        *registry.workspace.persist_fault.lock().unwrap() = Some(PersistFault::AfterReplace);
+        let id = registry
+            .publish(
+                "app",
+                PublishRequest {
+                    limits: RequestLimits {
+                        max_rows: 2,
+                        request_timeout_ms: 5000,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let op = registry.wait_operation("app", id).await.unwrap();
+        assert_eq!(op.error.unwrap().code, "workspace_commit_uncertain");
+        assert_eq!(
+            registry.status("app").unwrap().phase,
+            Phase::RecoveryRequired
+        );
+        assert!(registry.publish("app", PublishRequest::default()).is_err());
+        registry.shutdown().await.unwrap();
+        drop(registry);
+        let registry = Registry::open(directory.path()).await.unwrap();
+        assert_eq!(registry.status("app").unwrap().limits.unwrap().max_rows, 2);
+        assert_eq!(registry.status("app").unwrap().phase, Phase::Ready);
+        registry.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn ids_are_typed_canonical_and_round_trip() {
+        for kind in [OperationKind::Publish, OperationKind::Unregister] {
+            let id = OperationId::new(kind);
+            assert_eq!(id.to_string().parse::<OperationId>().unwrap(), id);
+            assert!(id.to_string().starts_with(kind.prefix()));
+            assert_eq!(
+                serde_json::from_str::<OperationId>(&serde_json::to_string(&id).unwrap()).unwrap(),
+                id
+            );
+            assert_ne!(id, OperationId::new(kind));
+        }
+        for invalid in [
+            "1",
+            "op-123",
+            "publish-ABC",
+            "publish-01",
+            "publish-",
+            "publish-zzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            assert!(invalid.parse::<OperationId>().is_err());
+        }
+        let max = OperationId {
+            kind: OperationKind::Publish,
+            value: u128::MAX,
+        };
+        assert_eq!(max.to_string().parse::<OperationId>().unwrap(), max);
+    }
 }

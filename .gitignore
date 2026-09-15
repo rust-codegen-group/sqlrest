@@ -2,4 +2,6 @@
 *.db
 *.db-wal
 *.db-shm
-
+.sqlrest.lock
+.database-*.tmp
+**/databases/*/database.toml

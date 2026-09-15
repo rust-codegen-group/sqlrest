@@ -1,6 +1,6 @@
 use clap::Parser;
 use sqlrest::{http::Server, registry::Registry};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -8,6 +8,8 @@ use std::net::SocketAddr;
     about = "Typed SQL HTTP interfaces. No built-in authentication; protect both listeners."
 )]
 struct Arguments {
+    #[arg(long)]
+    workspace: PathBuf,
     #[arg(long)]
     data_listen: SocketAddr,
     #[arg(long)]
@@ -37,7 +39,7 @@ async fn run(arguments: Arguments) -> Result<(), sqlrest::SqlrestError> {
         )
     })?;
     let server = Server::bind(
-        Registry::new(),
+        Registry::open(&arguments.workspace).await?,
         arguments.data_listen,
         arguments.management_listen,
     )

@@ -156,6 +156,7 @@ impl Plan {
 
 impl Migrator {
     pub async fn history(&self) -> Result<Vec<AppliedMigration>, SqlrestError> {
+        let deadline = tokio::time::Instant::now() + self.timeout;
         let exists = match self.backend {
             Backend::Turso => {
                 "SELECT count(*) AS total FROM main.sqlite_schema WHERE name='__sqlrest_migrations'"
@@ -180,12 +181,19 @@ impl Migrator {
             "SELECT version,filename,source,checksum FROM {} ORDER BY version",
             table(self.backend)
         );
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(crate::turso_driver::timeout)?;
         let bytes = self
             .executor
             .execute(
                 endpoint("get", &sql, Some(RECORD), self.backend)?,
                 Input::default(),
-                self.limits(),
+                Limits {
+                    timeout: remaining,
+                    ..self.limits()
+                },
             )
             .await?;
         tokio::task::spawn_blocking(move || decode_history(&bytes))

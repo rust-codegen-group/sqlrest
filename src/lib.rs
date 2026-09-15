@@ -10,5 +10,6 @@ pub mod response;
 mod schema;
 pub mod sql;
 pub mod turso_driver;
+pub mod workspace;
 
 pub use error::SqlrestError;

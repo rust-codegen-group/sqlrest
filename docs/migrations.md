@@ -8,19 +8,17 @@ does the next file start. Completed earlier files are never undone by a later
 failure.
 
 ```rust,no_run
-use sqlrest::registry::{Outcome, Registry};
+use sqlrest::registry::{Outcome, PublishRequest, Registry};
 
 async fn migrate_registered_database(registry: &Registry) -> Result<(), sqlrest::SqlrestError> {
-    let id = registry.migrate("notes")?;
+    let id = registry.publish("notes", PublishRequest::default())?;
     let operation = registry.wait_operation("notes", id).await?;
     if operation.outcome == Outcome::Failed {
-        // Inspect operation.error and operation.migration, then repair.
+        // Inspect operation.error and operation.publish, then repair.
         // A failed operation does not imply that earlier files rolled back.
         return Err(operation.error.expect("failed operations carry an error"));
     }
-    // A database without a previously published snapshot still needs explicit reload.
-    let id = registry.reload("notes")?;
-    registry.wait_operation("notes", id).await?;
+    // Successful publish includes interface loading. Check application behavior.
     Ok(())
 }
 ```
@@ -42,7 +40,7 @@ SQL uses the supported transactional statement subset described in
 to support every PostgreSQL or SQLite DDL feature. In particular, explicit
 BEGIN/COMMIT and PostgreSQL CREATE INDEX CONCURRENTLY are unsupported.
 
-The runtime must finish deployment before migrate, keeping all files stable
+The runtime must finish deployment before publish, keeping all files stable
 during the read. SQL text, binding inputs and checksums used for execution are
 derived from that same owned plan, never from a second file read. Later disk
 edits affect only a future operation. History is rechecked after request drain
@@ -65,16 +63,17 @@ A history INSERT failure rolls back the file's business changes too.
 
 `registry.export_migrations(name).await` returns ordered `AppliedMigration`
 records without writing local files. It checks version/filename/checksum
-integrity before returning data, works while paused, and participates in drain.
-It is unavailable during migration execution or unregister. Dropping its waiter
-does not release database resources ahead of the actual read completion.
+integrity before returning data and participates in drain. It works in recovery
+state when database resources are available, but is unavailable throughout
+publish or unregister. Dropping its waiter does not release database resources
+ahead of the actual read completion.
 
 For a missing/edited historical file:
 
 1. Export the database's original records.
 2. Back up local edits before restoring the exact original filenames and SQL.
 3. Put the intended new changes in a higher-version file.
-4. Run migrate and check the resulting API/data behavior.
+4. Run publish and check the resulting API/data behavior.
 
 There is no ignore-checksum switch, down migration or history overwrite API.
 Original SQL may contain sensitive literals: protect exports like database
@@ -84,7 +83,7 @@ not undo a committed destructive migration.
 
 ## State and failure contract
 
-Migrate shares the same per-configuration management slot as reload/unregister.
+Migration is an internal step of publish, sharing its management slot with unregister.
 It returns an operation ID immediately, continues independently of its waiter,
 and rejects concurrent management changes with 409. Status and the published
 OpenAPI remain queryable throughout. Other databases remain independent.
@@ -92,53 +91,48 @@ OpenAPI remain queryable throughout. Other databases remain independent.
 | Event | Data state / next step |
 | --- | --- |
 | Preflight fails on a healthy database | Old snapshot keeps serving |
-| Preflight fails on an already paused database | Existing pause reason is retained |
-| Preflight succeeds | `migrating`; new data requests get 503; existing requests drain |
-| A file fails or commit is uncertain | `paused`, `migration_failed`; fix and retry migrate; reload alone is rejected |
-| Migration succeeds with a published snapshot | Automatic reload and resume inside the same operation |
-| Automatic reload fails | `paused`, `reload_failed`; committed files remain committed; repair interfaces and reload |
-| Migration succeeds without a published snapshot | `unloaded`; first publication requires explicit reload |
+| Preflight fails on an already blocked database | Existing recovery blocker is retained |
+| Pending migration preflight succeeds | `publishing`; new requests get 503; existing requests drain |
+| A file fails or commit is uncertain | `recovery_required`, recovery `migration`; fix and retry publish |
+| Migration succeeds | Persist recovery `reload`, then load interfaces in the same publish |
+| Interface loading fails after migration | `recovery_required`, recovery `reload`; committed files remain; repair and publish |
+| First publication is interrupted | Persisted recovery blocker prevents automatic startup publication |
 
-An empty/no-pending plan also follows the success publication rule. A no-op
-migrate is not an exemption from automatic reload or its failure handling.
+An empty/no-pending plan still loads interfaces. Without new migrations, a failed
+interface load preserves a previously healthy snapshot and its limits.
 Success means the engine completed the operation, not that the application's
 behavior has been verified. The runtime must check the affected endpoints/data
-after automatic resume.
+after successful publication.
 
-Operation progress distinguishes preflight, draining, applying, reloading and
+Publish progress distinguishes connecting, preflight, draining, applying, loading and
 complete. `current_version` identifies an in-flight file, `failed_version` a
 failed attempt, and `applied_versions` only those commits confirmed in this
-operation—not the entire history. `interfaces_reloaded` distinguishes automatic
-publication from the first-use unloaded case.
+operation—not the entire history.
 
-Every migration-file transaction and history-read transaction uses the configured
-execution timeout and the existing driver's cancellation/cleanup semantics.
-It is not one aggregate deadline for the entire management operation; filesystem
-read/compilation, history verification and draining have no new timeout setting.
+`migration_timeout_ms` defaults to 60000 on each publish and limits the whole
+migration batch, not each file. History validation and applying pending files
+share the budget; request draining and connection/interface loading are outside
+it. The business `request_timeout_ms` (default 5000) is independent.
+Cancellation/rollback cleanup is awaited even after the budget expires.
 Business response `max_rows` does not cap migration intermediate results or
 history export. There is no extra row/byte/concurrency cap for management work.
 
 `commit_outcome_unknown` must not be reported as a guaranteed rollback. An
-explicit migrate retry rechecks committed history and skips matching versions;
+explicit publish retry rechecks committed history and skips matching versions;
 there is no automatic retry of business SQL. Transaction guarantees do not cover
 external effects of SQL functions.
 
 ## Restart contract
 
-Registry state, pause reasons and operation IDs are in memory only. Both process
-restart and unregister/re-register return a database to `unloaded` without
-automatically publishing it. A successful V1 record cannot prove whether V2
-was never attempted, failed, or was interrupted.
-
-For configurations using migrations, the runtime must restore in this order:
-`register → migrate → reload`, then check behavior. Matching committed files
-are skipped; uncommitted files are attempted again. Within a registration,
-reload cannot bypass a migration-failure pause. Across registrations the server
-does **not** persist that failure or prohibit direct reload; correct recovery
-order is the runtime's responsibility.
+TOML registration, limits and recovery blockers survive restart. Healthy entries
+load their current interfaces; blocked entries remain unavailable. No migration
+is automatically replayed. After repair, publish checks history, skips matching
+commits and attempts pending files. Operation records are not persisted.
+Unregister deletes only registration TOML; later publish needs connection config.
 
 The runtime must designate one migrator per real PostgreSQL database, even when
 multiple configurations/processes can reach it. There are no advisory locks,
-distributed coordination, durable operation queues or cross-process Turso
-ownership guarantees. Keep the Tokio runtime alive until accepted operations
+distributed coordination or durable operation queues. One process owns a workspace
+through its filesystem lock; the runtime must still avoid sharing Turso files
+across different workspaces or bypassing the Registry. Keep Tokio alive until operations
 finish; forced process exit is not graceful shutdown.

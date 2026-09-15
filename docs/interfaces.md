@@ -25,7 +25,8 @@ queries/
 - The interface tree contains only supported SQL/schema files and ordinary
   directories. Unexpected files, orphan schemas, symlinks and devices are errors.
   Keep documentation and migrations outside this directory. The directory root
-  itself may be reached through a deployment symlink.
+  itself may be reached through a deployment symlink when using `Snapshot::load`
+  directly; the Registry's fixed workspace layout rejects managed-path symlinks.
 - Static routes take precedence at the first differing segment. The path is
   selected before its method: a missing method on a static path is 405, not a
   fallback to a dynamic route.

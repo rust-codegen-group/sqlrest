@@ -3,7 +3,7 @@ use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
 use sqlrest::{
     http::Server,
-    registry::{MigrationStep, OperationId, Outcome, Phase, Registry},
+    registry::{OperationId, Outcome, Phase, PublishStep, Registry},
 };
 use std::{fs, net::SocketAddr, time::Duration};
 use tokio::{
@@ -31,9 +31,9 @@ struct Harness {
 impl Harness {
     async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let interfaces = directory.path().join("interfaces");
-        fs::create_dir(&interfaces).unwrap();
-        let migrations = directory.path().join("migrations");
+        let interfaces = directory.path().join("databases/db/interfaces");
+        fs::create_dir_all(&interfaces).unwrap();
+        let migrations = directory.path().join("databases/db/migrations");
         fs::create_dir(&migrations).unwrap();
         fs::write(migrations.join("0001_initial.sql"), INITIAL).unwrap();
         fs::write(
@@ -68,7 +68,7 @@ impl Harness {
             fs::write(root.join("get.sql"), sql).unwrap();
             fs::write(root.join("get.response.yaml"), VALUE).unwrap();
         }
-        let registry = Registry::new();
+        let registry = Registry::open(directory.path()).await.unwrap();
         let server = Server::bind(
             registry.clone(),
             "127.0.0.1:0".parse().unwrap(),
@@ -100,25 +100,25 @@ impl Harness {
 
     fn config(&self, timeout: u64) -> Value {
         json!({
-            "database":{"kind":"turso","path":self.directory.path().join("data.db")},
-            "interfaces":self.directory.path().join("interfaces"),
-            "migrations":self.directory.path().join("migrations"),
-            "limits":{"timeout_ms":timeout,"max_rows":10}
+            "database":{"kind":"turso"},
+            "limits":{"request_timeout_ms":timeout,"max_rows":10}
         })
     }
 
     async fn register(&self, timeout: u64) -> Value {
         let response = self
             .client
-            .put(&format!("{}/databases/db", self.management))
+            .post(&format!("{}/databases/db/publish", self.management))
             .unwrap()
             .json(&self.config(timeout))
             .unwrap()
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        response.json().await.unwrap()
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: Value = response.json().await.unwrap();
+        self.wait(body["operation_id"].as_str().unwrap().to_owned())
+            .await
     }
 
     async fn operation(&self, method: Method, suffix: &str) -> Value {
@@ -126,15 +126,18 @@ impl Harness {
             .client
             .request(method, &format!("{}/databases/db{suffix}", self.management))
             .unwrap()
+            .json(&json!({}))
+            .unwrap()
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body: Value = response.json().await.unwrap();
-        self.wait(body["operation_id"].as_u64().unwrap()).await
+        self.wait(body["operation_id"].as_str().unwrap().to_owned())
+            .await
     }
 
-    async fn wait(&self, id: u64) -> Value {
+    async fn wait(&self, id: String) -> Value {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let response = self
@@ -157,15 +160,7 @@ impl Harness {
     }
 
     async fn initialize(&self, timeout: u64) {
-        assert_eq!(self.register(timeout).await["phase"], "unloaded");
-        assert_eq!(
-            self.operation(Method::POST, "/migrate").await["outcome"],
-            "succeeded"
-        );
-        assert_eq!(
-            self.operation(Method::POST, "/reload").await["outcome"],
-            "succeeded"
-        );
+        assert_eq!(self.register(timeout).await["outcome"], "succeeded");
     }
 
     async fn close(&mut self) {
@@ -206,24 +201,21 @@ async fn postgres_http_lifecycle() {
     let mut url = url::Url::parse(&connection).unwrap();
     url.set_path(&database);
     config["database"] = json!({"kind":"postgres_unencrypted","connection":url.as_str()});
-    assert_eq!(
-        h.client
-            .put(&format!("{}/databases/db", h.management))
-            .unwrap()
-            .json(&config)
-            .unwrap()
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-    for action in ["/migrate", "/reload"] {
-        assert_eq!(
-            h.operation(Method::POST, action).await["outcome"],
-            "succeeded"
-        );
-    }
+    let response = h
+        .client
+        .post(&format!("{}/databases/db/publish", h.management))
+        .unwrap()
+        .json(&config)
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let id = response.json::<Value>().await.unwrap()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(h.wait(id).await["outcome"], "succeeded");
     let response = h
         .client
         .post(&format!("{}/db/db", h.data))
@@ -297,7 +289,14 @@ async fn binary_wildcard_bind_and_sigterm() {
             .status
             .success()
     );
+    let mut h = Harness::new().await;
+    h.close().await;
+    let spare = tempfile::tempdir().unwrap();
+    let retired = std::mem::replace(&mut h.registry, Registry::open(spare.path()).await.unwrap());
+    drop(retired);
     let mut child = tokio::process::Command::new(binary)
+        .arg("--workspace")
+        .arg(h.directory.path())
         .args([
             "--data-listen",
             "0.0.0.0:0",
@@ -320,8 +319,6 @@ async fn binary_wildcard_bind_and_sigterm() {
         .split_once(" management=")
         .unwrap();
     assert!(data.starts_with("0.0.0.0:"));
-    let mut h = Harness::new().await;
-    h.close().await;
     h.data = format!("http://{}", data.replace("0.0.0.0", "127.0.0.1"));
     h.management = format!("http://{management}");
     h.initialize(5000).await;
@@ -356,7 +353,7 @@ async fn binary_wildcard_bind_and_sigterm() {
 async fn real_http_lifecycle_matches_embedded_registry() {
     let mut h = Harness::new().await;
     let status = h.register(5000).await;
-    assert_eq!(status["phase"], "unloaded");
+    assert_eq!(status["outcome"], "succeeded");
     assert_eq!(
         h.client
             .get(&format!("{}/db/db", h.data))
@@ -365,29 +362,32 @@ async fn real_http_lifecycle_matches_embedded_registry() {
             .await
             .unwrap()
             .status(),
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::OK
     );
-    assert_eq!(h.register(5000).await["phase"], "unloaded");
+    assert_eq!(h.register(5000).await["outcome"], "succeeded");
     let mut different = h.config(5000);
     different["limits"]["max_rows"] = json!(20);
+    let response = h
+        .client
+        .post(&format!("{}/databases/db/publish", h.management))
+        .unwrap()
+        .json(&different)
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let id = response.json::<Value>().await.unwrap()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(h.wait(id).await["outcome"], "succeeded");
     assert_eq!(
-        h.client
-            .put(&format!("{}/databases/db", h.management))
-            .unwrap()
-            .json(&different)
-            .unwrap()
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::CONFLICT
+        h.registry.status("db").unwrap().limits.unwrap().max_rows,
+        20
     );
     assert_eq!(
-        h.operation(Method::POST, "/migrate").await["migration"]["interfaces_reloaded"],
-        false
-    );
-    assert_eq!(
-        h.operation(Method::POST, "/reload").await["outcome"],
+        h.operation(Method::POST, "/publish").await["outcome"],
         "succeeded"
     );
     let response = h
@@ -449,12 +449,13 @@ async fn real_http_lifecycle_matches_embedded_registry() {
     let unregistered = h.operation(Method::DELETE, "").await;
     assert_eq!(unregistered["outcome"], "succeeded");
     assert_eq!(
-        h.wait(unregistered["id"].as_u64().unwrap()).await["outcome"],
+        h.wait(unregistered["id"].as_str().unwrap().to_owned())
+            .await["outcome"],
         "succeeded"
     );
     h.register(5000).await;
     assert_eq!(
-        h.operation(Method::POST, "/reload").await["outcome"],
+        h.operation(Method::POST, "/publish").await["outcome"],
         "succeeded"
     );
     let response: Value = h
@@ -593,7 +594,7 @@ async fn strict_http_inputs_paths_methods_and_separate_listeners() {
     invalid["unexpected"] = json!("secret-value");
     let failure = h
         .client
-        .put(&format!("{}/databases/other", h.management))
+        .post(&format!("{}/databases/other/publish", h.management))
         .unwrap()
         .json(&invalid)
         .unwrap()
@@ -609,7 +610,7 @@ async fn strict_http_inputs_paths_methods_and_separate_listeners() {
     );
     assert_eq!(
         h.client
-            .put(&format!("{}/databases/other", h.management))
+            .post(&format!("{}/databases/other/publish", h.management))
             .unwrap()
             .header_str("content-type", "application/json")
             .unwrap()
@@ -647,11 +648,13 @@ async fn http_migration_pause_repair_and_lost_accepted_response() {
     let mut h = Harness::new().await;
     h.initialize(5000).await;
     fs::write(
-        h.directory.path().join("migrations/0002_change.sql"),
+        h.directory
+            .path()
+            .join("databases/db/migrations/0002_change.sql"),
         "INSERT INTO missing VALUES(1)",
     )
     .unwrap();
-    let failed = h.operation(Method::POST, "/migrate").await;
+    let failed = h.operation(Method::POST, "/publish").await;
     assert_eq!(failed["outcome"], "failed");
     assert_eq!(
         h.client
@@ -670,22 +673,24 @@ async fn http_migration_pause_repair_and_lost_accepted_response() {
         .send()
         .await
         .unwrap();
-    assert_eq!(reload.status(), StatusCode::CONFLICT);
+    assert_eq!(reload.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         reload.json::<Value>().await.unwrap()["error"]["code"],
-        "migration_recovery_required"
+        "route_not_found"
     );
     fs::write(
-        h.directory.path().join("migrations/0002_change.sql"),
+        h.directory
+            .path()
+            .join("databases/db/migrations/0002_change.sql"),
         "INSERT INTO items VALUES(2,'two')",
     )
     .unwrap();
-    let repaired = h.operation(Method::POST, "/migrate").await;
+    let repaired = h.operation(Method::POST, "/publish").await;
     assert_eq!(repaired["outcome"], "succeeded");
-    assert_eq!(repaired["migration"]["interfaces_reloaded"], true);
-    // Do not consume the reload's HTTP response. Recover its ID from status.
+    assert_eq!(repaired["publish"]["step"], "complete");
+    // Do not consume the publish response. Recover its ID from status.
     let mut socket = TcpStream::connect(h.management_address).await.unwrap();
-    socket.write_all(b"POST /databases/db/reload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+    socket.write_all(b"POST /databases/db/publish HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
     let id = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let status: Value = h
@@ -704,7 +709,7 @@ async fn http_migration_pause_repair_and_lost_accepted_response() {
                 &status["last_operation"]
             };
             if op["id"] != repaired["id"] {
-                break op["id"].as_u64().unwrap();
+                break op["id"].as_str().unwrap().to_owned();
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -731,12 +736,12 @@ async fn admitted_upload_keeps_old_snapshot_and_counts_toward_drain() {
     .await
     .unwrap();
     fs::write(
-        h.directory.path().join("interfaces/post.sql"),
+        h.directory.path().join("databases/db/interfaces/post.sql"),
         "INSERT INTO items VALUES(${body.id:int64}, 'new snapshot') RETURNING id,value",
     )
     .unwrap();
     assert_eq!(
-        h.operation(Method::POST, "/reload").await["outcome"],
+        h.operation(Method::POST, "/publish").await["outcome"],
         "succeeded"
     );
     let response = h
@@ -748,8 +753,9 @@ async fn admitted_upload_keeps_old_snapshot_and_counts_toward_drain() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let id = response.json::<Value>().await.unwrap()["operation_id"]
-        .as_u64()
-        .unwrap();
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_eq!(h.registry.status("db").unwrap().phase, Phase::Unregistering);
     assert_eq!(
         h.client
@@ -785,7 +791,7 @@ async fn upload_budget_and_shutdown_abort_unaccepted_bodies() {
     assert!(response.starts_with("HTTP/1.1 504"));
     assert!(response.contains("execution_timeout"));
     let mut management = TcpStream::connect(h.management_address).await.unwrap();
-    management.write_all(b"PUT /databases/slow HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+    management.write_all(b"POST /databases/slow/publish HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
     let _idle = TcpStream::connect(h.management_address).await.unwrap();
     let mut incomplete_headers = TcpStream::connect(h.data_address).await.unwrap();
     incomplete_headers
@@ -795,7 +801,10 @@ async fn upload_budget_and_shutdown_abort_unaccepted_bodies() {
     h.close().await;
     assert!(h.registry.is_shutting_down());
     assert_eq!(
-        h.registry.reload("db").unwrap_err().code,
+        h.registry
+            .publish("db", Default::default())
+            .unwrap_err()
+            .code,
         "server_shutting_down"
     );
 }
@@ -815,13 +824,17 @@ async fn shutdown_finishes_accepted_migration_and_releases_file_identity() {
     .await
     .unwrap();
     fs::write(
-        h.directory.path().join("migrations/0002_shutdown.sql"),
+        h.directory
+            .path()
+            .join("databases/db/migrations/0002_shutdown.sql"),
         "INSERT INTO items VALUES(2,'after drain')",
     )
     .unwrap();
     let response = h
         .client
-        .post(&format!("{}/databases/db/migrate", h.management))
+        .post(&format!("{}/databases/db/publish", h.management))
+        .unwrap()
+        .json(&json!({}))
         .unwrap()
         .send()
         .await
@@ -838,11 +851,11 @@ async fn shutdown_finishes_accepted_migration_and_releases_file_identity() {
             .current_operation
             .as_ref()
             .unwrap()
-            .migration
+            .publish
             .as_ref()
             .unwrap()
             .step
-            != MigrationStep::Draining
+            != PublishStep::Draining
         {
             tokio::task::yield_now().await;
         }
@@ -856,23 +869,11 @@ async fn shutdown_finishes_accepted_migration_and_releases_file_identity() {
         Outcome::Succeeded
     );
     assert_eq!(h.registry.status("db").unwrap().phase, Phase::Unregistered);
-    // Shutdown released the same-file claim, not just the HTTP listener.
-    let registry = Registry::new();
-    registry
-        .register(
-            "again",
-            sqlrest::registry::Configuration {
-                target: sqlrest::registry::Target::Turso(h.directory.path().join("data.db")),
-                interfaces: h.directory.path().join("interfaces"),
-                migrations: h.directory.path().join("migrations"),
-                limits: sqlrest::execution::Limits {
-                    timeout: Duration::from_secs(3),
-                    max_rows: 10,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(registry.export_migrations("again").await.unwrap().len(), 2);
+    // Release all workspace owners, then recover without registration replay.
+    let spare = tempfile::tempdir().unwrap();
+    let retired = std::mem::replace(&mut h.registry, Registry::open(spare.path()).await.unwrap());
+    drop(retired);
+    let registry = Registry::open(h.directory.path()).await.unwrap();
+    assert_eq!(registry.export_migrations("db").await.unwrap().len(), 2);
     registry.shutdown().await.unwrap();
 }

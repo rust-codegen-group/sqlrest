@@ -1,135 +1,158 @@
-# Database registry
+# Workspace and publication
 
-`registry::Registry` owns database configurations, immutable interface snapshots,
-request admission and in-memory management operations. It has no HTTP dependency.
-Registry clones share state; independent instances have separate names but share
-process-wide Turso file ownership checks.
+`Registry::open(workspace).await` acquires a workspace lock and restores persisted
+databases. Clones share ownership; keep the Tokio runtime alive until shutdown
+finishes. Drop all registry clones before reopening the same workspace.
 
 ```rust,no_run
 use sqlrest::{
-    execution::Limits,
     params::Input,
-    registry::{Configuration, Outcome, Registry, Target},
+    registry::{DatabaseConfig, Outcome, PublishRequest, Registry},
 };
-use std::{path::PathBuf, time::Duration};
 
 async fn example() -> Result<(), sqlrest::SqlrestError> {
-    let registry = Registry::new();
-    registry.register("notes", Configuration {
-        target: Target::Turso(PathBuf::from("/data/notes.db")),
-        interfaces: PathBuf::from("/data/interfaces"),
-        migrations: PathBuf::from("/data/migrations"),
-        limits: Limits { timeout: Duration::from_secs(5), max_rows: 100 },
-    }).await?;
-    let id = registry.reload("notes")?;
+    // Prepare databases/notes/interfaces and migrations before publishing.
+    let registry = Registry::open("/data/sqlrest").await?;
+    let id = registry.publish("notes", PublishRequest {
+        database: Some(DatabaseConfig::Turso {}),
+        ..Default::default()
+    })?;
     let operation = registry.wait_operation("notes", id).await?;
     if operation.outcome == Outcome::Succeeded {
         let bytes = registry.execute("notes", "get", &[], Input::default()).await?;
-        // Send these complete JSON bytes to the caller.
         drop(bytes);
     }
-    let id = registry.unregister("notes")?;
-    registry.wait_operation("notes", id).await?;
+    // Shutdown preserves registrations; unregister explicitly removes one.
+    registry.shutdown().await?;
     Ok(())
 }
 ```
 
-## Registration
+## Fixed layout
 
-All configuration fields are explicit. Names are nonempty ASCII letters, digits,
-underscores or hyphens. Paths become absolute at registration; the current
-directory must not be changed concurrently. Configuration equality compares
-those paths, the backend configuration and both limits. A different textual
-symlink/hard-link path is a different configuration, even if it targets the same
-file. No credentials are included in status output.
+```text
+workspace/
+  .sqlrest.lock
+  databases/
+    notes/
+      database.toml
+      data.db
+      interfaces/
+        get.sql
+        get.response.yaml
+      migrations/
+        0001_notes.sql
+```
 
-Registering the same name/configuration is idempotent, including during concurrent
-registration. A different configuration returns `configuration_conflict` (409)
-without touching the proposed replacement file. An idempotent call during
-unregister reports `unregistering`; it does not cancel or reverse unregister.
-Failed registration releases its name reservation and can be retried.
+Names are nonempty ASCII letters, digits, underscores or hyphens. The directory
+name is the database registration name. Paths cannot be overridden; local Turso
+always uses `data.db`. No symlinks are accepted for managed layout paths.
+The workspace lock is held for the registry/resources' lifetime. Do not delete
+or replace its lock file while in use. Process-wide Turso file identity claims
+also reject duplicate ownership through hard links. This is not a hostile
+filesystem sandbox; do not independently open or replace managed database files.
 
-Registration opens/creates the Turso file or checks a PostgreSQL connection.
-It does not execute migrations or read/publish interfaces. The parent directory
-of a new Turso file must exist. Interface/migration directories may be deployed
-later. Failed registration never deletes or truncates a preexisting database;
-a newly created file may remain if opening fails.
+SQLRest owns `database.toml`; Agents edit interfaces and migrations, and pass
+configuration through publish (HTTP or a harness tool using the same Rust API).
+Offline human repair is possible. There is no watcher and no retained source
+copy from the last successful publish.
 
-Turso ownership checks use canonical paths and OS file identity, including
-hard links. Reservation is serialized before the engine opens the file, covering
-concurrent creation through path aliases. The identity handle remains owned until
-all admitted requests have cleaned up and database resources are released.
-The runtime must not replace/rename/unlink the database file or retarget its
-directory/symlinks while registered. This is not an adversarial filesystem
-sandbox or cross-process lock. Do not bypass the registry by independently
-opening the same file with a raw driver.
+```toml
+[database]
+kind = "turso"
 
-`Target::PostgresUnencrypted(Box<tokio_postgres::Config>)` uses the explicit
-unencrypted connection contract described in `execution.md`. The connection
-check uses the configured execution timeout. Different PostgreSQL databases
-can share a server endpoint; each configuration targets one database. No
-server-alias deduplication or PostgreSQL advisory locks are added.
+[state]
+recovery = "none"
 
-## Publication and operations
+[limits]
+request_timeout_ms = 5000
+max_rows = 1000
+```
 
-`reload`, `migrate` and `unregister` synchronously reserve a per-database management slot,
-return an opaque operation ID, and continue in the background. They require an
-active Tokio runtime. A conflicting operation immediately returns
-`operation_in_progress` (409), never queues. Other databases may operate
-concurrently. Dropping a registration/operation waiter does not cancel accepted
-work. Keep the runtime alive until it finishes.
+For PostgreSQL use `kind = "postgres_unencrypted"` and a `connection` string in
+`[database]`. The constructor is explicitly unencrypted; see `execution.md`.
+Secrets are not included in status or OpenAPI. TOML files are written with
+owner-only permissions on Unix, atomic same-directory replacement and sync.
+Back up database contents independently; config/history is not a data backup.
 
-Reload reads and compiles a complete candidate snapshot without executing
-business SQL. On success, one locked swap publishes its routes, SQL, parameter
-and response contracts, OpenAPI and version together. Old requests retain the
-snapshot admitted with them. On failure, the published snapshot is unchanged;
-an initial failure leaves the database unloaded. The runtime must finish file
-deployment before reload and keep the files stable during its read.
+## Publish
 
-`status` exposes phase, version, active request count, current operation and
-most recent completed operation. `openapi` reads only the published snapshot;
-status/OpenAPI remain available while management work is running. `execute`
-resolves a route and admits it atomically against publication/unregister.
-Resolved path parameters replace any caller-provided `Input.path`.
+Only `publish` and `unregister` mutate lifecycle state. There are no public
+register/migrate/reload/pause/resume methods or routes. Publication consists of:
 
-| Phase | Data requests |
+1. Create or reuse a registration; validate the proposed connection.
+2. Load the migration plan once and validate its committed history.
+3. If needed, close admission, drain, persist recovery state and apply migrations.
+4. Load/validate interfaces, persist effective config, then atomically adopt
+   the snapshot and its limits.
+
+First publish requires `database`; later omission reuses the saved connection.
+Providing it replaces the entire database configuration, never merges fields.
+A changed target is validated before disturbing the old service. Then requests
+drain, the new connection/recovery state is persisted, and publication proceeds
+against the new database's own migration history. Failures after target adoption
+do not silently fall back to the old target. No data is copied or deleted.
+
+`limits` fields independently default to 5000 milliseconds / 1000 rows on **every**
+publish, not to the prior configuration. Both must be positive integers.
+Explicit null and unknown fields are rejected. Effective values are persisted;
+restart uses those values rather than applying defaults again.
+`migration_timeout_ms` defaults to 60000 and is per-publish only, not persisted.
+
+Ordinary publication without migrations can keep serving the old snapshot.
+If its interface validation or pre-replacement config write fails, old interfaces
+and limits remain effective. Once migrations have run, a failed publication
+blocks service instead. Configuration replacement followed by failed directory
+sync is an uncertain durability result: admission closes and restart is required
+to reread authoritative state before another publish.
+
+## Recovery and startup
+
+| `state.recovery` | Meaning |
 | --- | --- |
-| `registering` | 503 |
-| `unloaded` | 503 |
-| `ready` (including reload in progress) | Published snapshot |
-| `migrating` or `paused` | 503; see `migrations.md` for recovery |
-| `unregistering` | 503; admitted requests drain |
-| `unregistered` | 503 |
+| `none` | No durable publication blocker |
+| `migration` | Migrations have not been confirmed complete |
+| `reload` | Interfaces still need successful loading, including first publish |
 
-A failed registration can briefly be observable as `registration_failed`
-before its reservation is removed.
+Internal registration starts with `reload`; restart cannot accidentally publish
+an unfinished first publication. Before database mutation, persist `migration`;
+after migration success persist `reload`; only successful interface loading and
+config persistence clear it. Do not edit this state to bypass recovery.
 
-## Unregister and result retention
+Startup loads valid `none` entries from current files. Blocked entries remain
+unavailable until publish succeeds. No migration/task replay happens automatically.
+Invalid TOML, missing data files, connection errors and interface errors are
+retained by directory name without stopping healthy databases. A missing local
+file in a persisted registration is never recreated, even on a publish retry.
+Directories without `database.toml` are ignored. Whole-workspace I/O/lock failures
+fail startup. Process startup does not imply every database is ready.
 
-Unregister immediately closes admission, waits for admitted request execution
-and actual transaction cleanup, then releases the snapshot, database and Turso
-file claim. Cancelling a caller does not prematurely decrement the active count.
-No extra drain timeout or forced transaction termination is introduced: requests
-have their configured deadline and the cleanup behavior described in
-`execution.md`. OS/driver stalls are not hard real-time bounded.
+Fix interface/connection availability and publish to retry. A malformed TOML
+requires repair and restart; publish does not silently replace unreadable config.
+Unregister stops admission, drains and durably removes only `database.toml`,
+then releases resources. Database, interface and migration files remain.
+Republish after unregister requires connection configuration again.
+Shutdown drains without deleting registrations or changing recovery flags.
 
-Unregister never deletes database files or PostgreSQL data. A lightweight
-`unregistered` entry retains the latest operation result, so the ID is still
-queryable after completion. Re-registering the name replaces that entry and
-clears its old results; registering a different name may reuse the released file.
+## Operations and admission
 
-`operation(name, id)` and `wait_operation(name, id)` expose only the current and
-latest completed operation, not an operation history. Older results return
-`operation_not_found` (404). An already-waiting call remains bound to its original
-registration, even if that name is later reused. Retired names have no time-based
-expiry and remain until reused or the Registry is dropped. Registry/process
-restart loses all names, snapshots and operation IDs; the runtime must re-register.
-There is no persisted registry/operation queue. The HTTP transport is described in
-`http.md`.
-Forward-only migration history and recovery are described in `migrations.md`.
+Publish/unregister reserve one management slot per name and return immediately.
+Conflicts return `operation_in_progress` (409), not a queue. Other names remain
+independent. Disconnects and dropped waiters do not cancel accepted work.
+IDs are `publish-<uuid-base36>` / `unregister-<uuid-base36>`: lowercase,
+full 128-bit random UUIDs, no padding. Treat the whole ID as opaque.
 
-`Registry::shutdown().await` permanently closes new admission across all clones,
-waits for accepted registration, management operations and request cleanup, then
-releases database resources. It is idempotent; cancelling a shutdown waiter does
-not cancel the coordinator. Status and retained operation results remain readable.
-Keep the Tokio runtime alive until completion. Create a new Registry to restart.
+`status` / `statuses` include phase, version, recovery, effective limits, active
+request count, current/latest operations and sanitized errors. `openapi` reflects
+the retained published snapshot, not necessarily an available data service.
+Only `ready` admits requests; old requests hold their original snapshot/limits
+until actual execution and cleanup finish. Shutdown closes global admission.
+
+Operation records are in memory only. Only current/latest results are retained;
+404 means unavailable, not "failed" or "never ran". Restart cannot reuse a numeric
+ID for an unrelated operation. Inspect database state before deciding to retry.
+An accepted 202 is not a durable task queue or cross-restart execution promise.
+
+For shared PostgreSQL targets, the runtime still appoints one migrator per real
+database and keeps aliases' migration histories coherent. No advisory lock or
+distributed coordination is added. SQL and filesystem config remain trusted.

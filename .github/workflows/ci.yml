@@ -34,15 +34,13 @@ jobs:
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev pkg-config postgresql-client
+          sudo apt-get install -y clang libclang-dev pkg-config postgresql-client curl xz-utils
           npm install --prefix "$RUNNER_TEMP/sqlrest-typescript" --ignore-scripts typescript@6.0.3
           echo "$RUNNER_TEMP/sqlrest-typescript/node_modules/.bin" >> "$GITHUB_PATH"
-      - name: Build pinned openapi-nexus from source
+      - name: Download pinned openapi-nexus binary
         run: |
-          git clone --no-checkout https://github.com/rust-codegen-group/openapi-nexus.git "$RUNNER_TEMP/openapi-nexus"
-          git -C "$RUNNER_TEMP/openapi-nexus" checkout --detach 1f8e1d8a3264d697c3aca8db7db01148d878115a
-          cargo +1.98.0 build --locked --manifest-path "$RUNNER_TEMP/openapi-nexus/Cargo.toml" --bin openapi-nexus
-          echo "OPENAPI_NEXUS_BIN=$RUNNER_TEMP/openapi-nexus/target/debug/openapi-nexus" >> "$GITHUB_ENV"
+          bash scripts/download-openapi-nexus.sh "$RUNNER_TEMP/openapi-nexus"
+          echo "OPENAPI_NEXUS_BIN=$RUNNER_TEMP/openapi-nexus/openapi-nexus" >> "$GITHUB_ENV"
       - name: Create empty example database
         env:
           PGPASSWORD: sqlrest

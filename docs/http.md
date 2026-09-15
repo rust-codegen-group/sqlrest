@@ -1,7 +1,7 @@
 # HTTP and embedded delivery
 
-Run `sqlrest --data-listen 0.0.0.0:8080 --management-listen 127.0.0.1:8081`.
-Both flags are required; any bindable socket address is allowed. Both sockets
+Run `sqlrest --workspace /data/sqlrest --data-listen 0.0.0.0:8080 --management-listen 127.0.0.1:8081`.
+All three flags are required; any bindable socket address is allowed. Both sockets
 are bound before serving. The binary reports bound addresses on stderr; port 0
 is useful for embedding/testing.
 
@@ -10,42 +10,46 @@ The runtime/deployer must protect **both** listeners. Management can open
 database connections, read configured local files and execute trusted SQL.
 Never expose it to untrusted callers. SQL is not a sandbox.
 
-## Registration and operations
+## Publication and operations
 
-PUT `/databases/{name}` on the management listener accepts:
+POST `/databases/{name}/publish` on the management listener accepts:
 
 ```json
 {
-  "database": {"kind": "turso", "path": "/data/example.db"},
-  "interfaces": "/config/interfaces",
-  "migrations": "/config/migrations",
-  "limits": {"timeout_ms": 5000, "max_rows": 100}
+  "database": {"kind": "turso"},
+  "limits": {"request_timeout_ms": 5000, "max_rows": 1000},
+  "migration_timeout_ms": 60000
 }
 ```
 
 For PostgreSQL replace `database` with
 `{"kind":"postgres_unencrypted","connection":"postgresql://user:password@host/db"}`.
-This constructor explicitly uses an unencrypted connection. Fields are required;
-unknown fields and duplicate JSON keys are rejected. Configuration paths are
-server-local and must be readable by the service. Registration returns 200 status,
-initially unloaded. Repeat identical registration is idempotent; conflicts are 409.
+This constructor explicitly uses an unencrypted connection. First publish requires
+database configuration; later omission reuses it. Explicit configuration replaces
+the entire database target. Each omitted limit uses its default independently on
+every publish. Explicit null, unknown fields and duplicate keys are rejected.
+All paths come from the fixed workspace layout. Publish returns 202, then opens
+the database, runs pending migrations and loads interfaces. Conflicting operations
+return 409; there is no independent register/migrate/reload/pause/resume route.
 
 | Management request | Result |
 | --- | --- |
+| GET `/databases` | 200 statuses by name, including startup failures |
 | GET `/databases/{name}` | 200 status, current and latest operation |
 | DELETE `/databases/{name}` | 202 operation ID; unregister without deleting data |
-| POST `/databases/{name}/reload` | 202 operation ID |
-| POST `/databases/{name}/migrate` | 202 operation ID |
+| POST `/databases/{name}/publish` | 202 operation ID |
 | GET `/databases/{name}/operations/{id}` | 200 operation |
 | GET `/databases/{name}/openapi` | 200 OpenAPI; default server `/db/{name}` |
 | GET `/databases/{name}/migrations` | 200 `{"migrations":[...]}` with saved originals |
 
-202 bodies are `{"operation_id":1}`. Poll the operation until outcome is no
+202 bodies contain a string ID, e.g. `{"operation_id":"publish-abc123"}` (illustrative
+suffix; real IDs encode a full random UUID in lowercase base36). Poll until outcome is no
 longer `running`; acceptance is not success. A lost acknowledgement can be
 recovered through status. Accepted management work survives handler cancellation.
 Only OpenAPI accepts a query parameter: `server_url`, once, URL-encoded.
-Other management query parameters are rejected. Follow `migrations.md` for
-repair and restart: runtime retains configuration and re-registers after restart.
+Other management query parameters are rejected. Follow `migrations.md` for repair.
+Restart restores workspace configuration without runtime replay. Old operation
+records are lost: 404 is not proof of failure or non-execution.
 
 ## Data protocol
 
@@ -73,15 +77,16 @@ limit is installed, including Axum's usual body cap. Deployers can impose such
 limits at their proxy. Large CPU parsing may finish in the background after
 cancellation but cannot subsequently execute SQL.
 
-Management registration uploads have no ordinary upload deadline; server
+Management publish uploads have no ordinary upload deadline; server
 shutdown cancels incomplete uploads. Other management routes ignore bodies.
 
 ## Embedding and shutdown
 
-Use the same `Registry` directly in a live Tokio runtime, or pass it to
+Open with `Registry::open(workspace).await` in a live Tokio runtime, or pass it to
 `http::Server::bind` / `from_listeners`. Await `serve(shutdown_future)` to serve
 both listeners. `Registry::shutdown().await` closes global admission and drains
-accepted work. It cannot be reopened; create a new Registry.
+accepted work without deleting TOML registrations. Drop all owners before opening
+a new Registry for the same workspace.
 
 The binary handles Ctrl-C and Unix SIGTERM. Graceful server shutdown closes
 core admission first, stops listeners, cancels incomplete body reads and waits

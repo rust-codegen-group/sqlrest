@@ -3,7 +3,8 @@
 Typed SQL files → database-backed HTTP APIs for agent runtimes.
 
 SQLRest is a Rust library and a standalone HTTP service. An agent writes SQL and
-response schemas; the runtime registers a database and publishes its interfaces.
+response schemas in a fixed workspace; one publish call registers the database,
+applies pending migrations and publishes its interfaces.
 Turso is the default local backend; PostgreSQL supports remote/shared databases.
 There is no site or user model, authentication, UI renderer, or runtime SDK dependency.
 
@@ -28,7 +29,7 @@ properties:
 
 Success is always `{"records":[...]}`. SQL values are bound parameters. Requests
 are transactional; result validation and serialization happen before commit.
-Reload is explicit and atomic, and the published OpenAPI comes from the same snapshot.
+Publication is explicit and atomic, and OpenAPI comes from the same snapshot.
 
 ## Try it
 
@@ -42,7 +43,7 @@ python3 scripts/e2e.py
 
 This executable tutorial starts a real service with fresh temporary files, runs
 both Todolist and Ledger examples, verifies CRUD, retry keys, ID arrays and migration
-history repair, restarts the process, re-registers and verifies persistence. It
+history repair, restarts the process and verifies automatic recovery without replay. It
 then removes **only its temporary data**. It does not start a browser or retain
 an application for continued use.
 
@@ -50,7 +51,8 @@ For a persistent application, follow [Getting started](docs/getting-started.md).
 Run the service with explicit addresses, for example:
 
 ```sh
-target/debug/sqlrest --data-listen 127.0.0.1:8080 --management-listen 127.0.0.1:8081
+target/debug/sqlrest --workspace /data/sqlrest \
+  --data-listen 127.0.0.1:8080 --management-listen 127.0.0.1:8081
 ```
 
 Any bindable address is allowed. The addresses above are examples, not enforced
@@ -65,7 +67,7 @@ do not expose the management port to users. No auth, TLS or CORS is installed.
   strict compilation and real requests, without adding a service dependency.
 - [Runtime skill](skills/sqlrest-runtime/SKILL.md): copy the entire
   `skills/sqlrest-runtime` directory into your runtime's skill distribution.
-  Includes restart, polling, history repair and checking behavior after auto-resume.
+  Includes restart, polling, history repair and checking behavior after publish.
 - [Container and verification](docs/delivery.md): pinned inputs, local image,
   complete test gates and CI.
 
@@ -87,8 +89,9 @@ Important boundaries:
   stringification is implemented. Use deliberate application constraints/encoding.
 - A lost response or `commit_outcome_unknown` is not proof of rollback.
   Check stable business IDs before retrying.
-- The runtime persists registration configs, appoints one migrator per real PG
-  database, and prevents multiple processes opening the same Turso file.
+- SQLRest persists configuration and recovery state in its workspace. The runtime
+  appoints one migrator per real PG database and avoids sharing Turso files across
+  different workspaces. One Registry owns a workspace at a time.
 - Migration source history is for recovery, **not a database backup**. Arrange
   independent backups and test restoration before destructive changes.
 - MySQL, TLS-enabled PostgreSQL connections, down migrations, background watchers
