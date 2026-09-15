@@ -7,22 +7,24 @@ integer balances, and delete their own SDK test records.
 
 Verified inputs:
 
-- openapi-nexus `1f8e1d8a3264d697c3aca8db7db01148d878115a`
-  from `https://github.com/rust-codegen-group/openapi-nexus.git`
+- openapi-nexus **0.2.3**, downloaded from its GitHub release
 - Node.js 24.15.0 and TypeScript 6.0.3
 
-Build the generator from that revision with `cargo build --locked --bin
-openapi-nexus`. Install TypeScript in a disposable tools directory or use an
-existing matching installation; put its `tsc` on PATH.
+Download the pinned release binary, not the generator source. The shared CI/local
+script downloads and extracts the Linux x86_64 musl archive. It requires Bash,
+curl, tar and xz. Install TypeScript in a disposable tools directory or
+use an existing matching installation; put its `tsc` on PATH.
 
 ```sh
+SQLREST_TOOLS=$(mktemp -d)
+bash scripts/download-openapi-nexus.sh "$SQLREST_TOOLS/openapi-nexus"
 cargo build --locked
-OPENAPI_NEXUS_BIN=/absolute/path/to/openapi-nexus \
+OPENAPI_NEXUS_BIN="$SQLREST_TOOLS/openapi-nexus/openapi-nexus" \
   python3 scripts/e2e.py --sdk
 ```
 
 For PostgreSQL, also set `SQLREST_TEST_POSTGRES` to a **fresh disposable empty**
-database URL and add `--backend postgres`. These runs register/load the examples,
+database URL and add `--backend postgres`. These runs publish the examples,
 fetch their live OpenAPI, generate, strictly compile, then execute both clients:
 
 ```sh

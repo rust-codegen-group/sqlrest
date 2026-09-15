@@ -1,9 +1,8 @@
 //! Independent data and management listeners over the shared Registry.
 use crate::{
     SqlrestError,
-    execution::Limits,
     params::Input,
-    registry::{self, Configuration, Registry, Target},
+    registry::{self, PublishRequest, Registry},
 };
 use axum::{
     Router,
@@ -12,8 +11,8 @@ use axum::{
     http::{Method, StatusCode, header},
     response::Response,
 };
-use serde::{Deserialize, Serialize};
-use std::{future::Future, net::SocketAddr, path::PathBuf, time::Duration};
+use serde::Serialize;
+use std::{future::Future, net::SocketAddr};
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -205,6 +204,19 @@ async fn management_request(
     request: Request,
 ) -> Result<Response, SqlrestError> {
     let segments = path(request.uri().path())?;
+    if segments == ["databases"] {
+        if request.method() != Method::GET {
+            return Err(method_not_allowed("GET"));
+        }
+        if request.uri().query().is_some_and(|query| !query.is_empty()) {
+            return Err(SqlrestError::new(
+                400,
+                "invalid_query",
+                "Unsupported management query parameter",
+            ));
+        }
+        return json_response(StatusCode::OK, &state.registry.statuses());
+    }
     let (name, tail) = match segments.as_slice() {
         [prefix, name, tail @ ..] if prefix == "databases" && valid_name(name) => {
             (name.clone(), tail)
@@ -222,7 +234,7 @@ async fn management_request(
         ));
     }
     match (request.method().as_str(), tail) {
-        ("PUT", []) => {
+        ("POST", [operation]) if operation == "publish" => {
             require_json(request.headers())?;
             let bytes = tokio::select! {
                 biased;
@@ -230,26 +242,18 @@ async fn management_request(
                 bytes = read_body(request.into_body()) => bytes?,
             };
             let parsing = tokio::task::spawn_blocking(move || {
-                serde_json::from_slice::<Registration>(&bytes)
-                    .map_err(|_| invalid_configuration())?
-                    .convert()
+                serde_json::from_slice::<PublishRequest>(&bytes)
+                    .map_err(|_| invalid_configuration())
             });
             let config = tokio::select! {
                 biased;
                 _ = state.stop.cancelled() => return Err(registry::shutting_down()),
                 result = parsing => result.map_err(|_| server_failed())??,
             };
-            let status = tokio::select! {
-                biased;
-                _ = state.stop.cancelled() => return Err(registry::shutting_down()),
-                result = state.registry.register(&name, config) => result?,
-            };
-            json_response(StatusCode::OK, &status)
+            accepted(state.registry.publish(&name, config)?)
         }
         ("GET", []) => json_response(StatusCode::OK, &state.registry.status(&name)?),
         ("DELETE", []) => accepted(state.registry.unregister(&name)?),
-        ("POST", [operation]) if operation == "reload" => accepted(state.registry.reload(&name)?),
-        ("POST", [operation]) if operation == "migrate" => accepted(state.registry.migrate(&name)?),
         ("GET", [resource]) if resource == "openapi" => {
             let registry = state.registry.clone();
             let server_url = query
@@ -274,66 +278,16 @@ async fn management_request(
             StatusCode::OK,
             &state.registry.operation(&name, id.parse()?)?,
         ),
-        (_, []) => Err(method_not_allowed("DELETE, GET, PUT")),
-        (_, [resource])
-            if matches!(
-                resource.as_str(),
-                "reload" | "migrate" | "openapi" | "migrations"
-            ) =>
-        {
-            Err(method_not_allowed(
-                if matches!(resource.as_str(), "reload" | "migrate") {
-                    "POST"
-                } else {
-                    "GET"
-                },
-            ))
+        (_, []) => Err(method_not_allowed("DELETE, GET")),
+        (_, [resource]) if matches!(resource.as_str(), "publish" | "openapi" | "migrations") => {
+            Err(method_not_allowed(if resource == "publish" {
+                "POST"
+            } else {
+                "GET"
+            }))
         }
         (_, [resource, _]) if resource == "operations" => Err(method_not_allowed("GET")),
         _ => Err(not_found()),
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Registration {
-    database: DatabaseTarget,
-    interfaces: PathBuf,
-    migrations: PathBuf,
-    limits: HttpLimits,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum DatabaseTarget {
-    Turso { path: PathBuf },
-    PostgresUnencrypted { connection: String },
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HttpLimits {
-    timeout_ms: u64,
-    max_rows: usize,
-}
-
-impl Registration {
-    fn convert(self) -> Result<Configuration, SqlrestError> {
-        let target = match self.database {
-            DatabaseTarget::Turso { path } => Target::Turso(path),
-            DatabaseTarget::PostgresUnencrypted { connection } => Target::PostgresUnencrypted(
-                Box::new(connection.parse().map_err(|_| invalid_configuration())?),
-            ),
-        };
-        Ok(Configuration {
-            target,
-            interfaces: self.interfaces,
-            migrations: self.migrations,
-            limits: Limits {
-                timeout: Duration::from_millis(self.limits.timeout_ms),
-                max_rows: self.limits.max_rows,
-            },
-        })
     }
 }
 
@@ -448,7 +402,7 @@ fn invalid_configuration() -> SqlrestError {
     SqlrestError::new(
         400,
         "invalid_configuration",
-        "Invalid database registration configuration",
+        "Invalid publish configuration",
     )
 }
 

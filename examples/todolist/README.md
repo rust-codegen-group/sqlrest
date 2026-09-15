@@ -1,7 +1,8 @@
 # Todolist
 
 `turso/` and `postgres/` each contain complete loadable interfaces and migrations.
-Follow the repository getting-started guide to register either directory.
+Follow the repository getting-started guide to copy either directory into the
+workspace and publish it.
 
 | Method and route | Body / behavior |
 | --- | --- |

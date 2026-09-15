@@ -39,8 +39,9 @@ def request(base, method, path, body=None, expected=200):
         return value
 
 
-def operation(management, name, action, success=True):
-    accepted = request(management, "POST", f"/databases/{name}/{action}", expected=202)
+def operation(management, name, success=True, config=None):
+    accepted = request(management, "POST", f"/databases/{name}/publish",
+                       {} if config is None else config, expected=202)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         result = request(management, "GET", f"/databases/{name}/operations/{accepted['operation_id']}")
@@ -48,7 +49,7 @@ def operation(management, name, action, success=True):
             assert (result["outcome"] == "succeeded") == success, result
             return result
         time.sleep(0.02)
-    raise TimeoutError(f"{action}: polling deadline (not proof of failure or rollback)")
+    raise TimeoutError("publish: polling deadline (not proof of failure or rollback)")
 
 
 @contextlib.contextmanager
@@ -61,6 +62,7 @@ def server(binary, image, workspace):
                 "docker", "run", "-d", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--mount", f"type=bind,src={workspace},dst=/workspace",
                 "-p", "127.0.0.1::8080", "-p", "127.0.0.1::8081", image,
+                "--workspace", "/workspace",
                 "--data-listen", "0.0.0.0:8080", "--management-listen", "0.0.0.0:8081",
             ], text=True, timeout=30).strip()
             ports = json.loads(subprocess.check_output([
@@ -70,7 +72,8 @@ def server(binary, image, workspace):
             management = f"http://127.0.0.1:{ports['8081/tcp'][0]['HostPort']}"
         else:
             child = subprocess.Popen([
-                binary, "--data-listen", "127.0.0.1:0", "--management-listen", "127.0.0.1:0",
+                binary, "--workspace", str(workspace),
+                "--data-listen", "127.0.0.1:0", "--management-listen", "127.0.0.1:0",
             ], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
             lines = queue.Queue()
             threading.Thread(target=lambda: lines.put(child.stderr.readline()), daemon=True).start()
@@ -112,25 +115,19 @@ def server(binary, image, workspace):
                                stdout=subprocess.DEVNULL, timeout=15)
 
 
-def configure(workspace, app, backend, postgres, image):
-    root = workspace / app
-    server_root = Path("/workspace") / app if image else root
-    target = ({"kind": "turso", "path": str(server_root / "data.db")}
+def configure(backend, postgres):
+    target = ({"kind": "turso"}
               if backend == "turso" else {"kind": "postgres_unencrypted", "connection": postgres})
     return {
         "database": target,
-        "interfaces": str(server_root / "interfaces"),
-        "migrations": str(server_root / "migrations"),
-        "limits": {"timeout_ms": 5000, "max_rows": 100},
+        "limits": {"request_timeout_ms": 5000, "max_rows": 100},
     }
 
 
 def deploy(management, app, config):
-    status = request(management, "PUT", f"/databases/{app}", config)
-    assert status["phase"] == "unloaded", status
-    operation(management, app, "migrate")
-    operation(management, app, "reload")
+    result = operation(management, app, config=config)
     assert request(management, "GET", f"/databases/{app}")["phase"] == "ready"
+    return result["id"]
 
 
 def records(data, app, method, path, body=None):
@@ -168,10 +165,10 @@ def crud(data):
 
 def recovery(data, management, workspace):
     # Change an applied migration, preserve edit, restore the exact exported original.
-    migration = next((workspace / "todolist/migrations").glob("*.sql"))
+    migration = next((workspace / "databases/todolist/migrations").glob("*.sql"))
     original = migration.read_bytes()
     migration.write_bytes(original + b"\n-- accidental history edit\n")
-    operation(management, "todolist", "migrate", success=False)
+    operation(management, "todolist", success=False)
     assert records(data, "todolist", "GET", "/todos")[0]["id"] == 41
     history = request(management, "GET", "/databases/todolist/migrations")["migrations"]
     assert len(history) == 1
@@ -180,9 +177,9 @@ def recovery(data, management, workspace):
     shutil.copyfile(migration, workspace / "saved-local-edit.sql")
     migration.write_text(record["source"])
     assert migration.read_bytes() == original
-    # New migration is a higher version. Successful migration auto-reloads/resumes.
-    (workspace / "todolist/migrations/0002_index.sql").write_text("CREATE INDEX todos_title ON todos(title);\n")
-    probe = workspace / "todolist/interfaces/version"
+    # Publish applies the higher version and loads the new interfaces.
+    (workspace / "databases/todolist/migrations/0002_index.sql").write_text("CREATE INDEX todos_title ON todos(title);\n")
+    probe = workspace / "databases/todolist/interfaces/version"
     probe.mkdir()
     (probe / "get.sql").write_text("SELECT CAST(2 AS BIGINT) AS version;\n")
     (probe / "get.response.yaml").write_text(json.dumps({
@@ -190,7 +187,7 @@ def recovery(data, management, workspace):
         "required": ["version"], "additionalProperties": False,
     }))
     request(data, "GET", "/db/todolist/version", expected=404)
-    operation(management, "todolist", "migrate")
+    operation(management, "todolist")
     assert records(data, "todolist", "GET", "/version") == [{"version": 2}]
     assert records(data, "todolist", "GET", "/todos")[0]["title"] == "Read the contract"
 
@@ -232,23 +229,23 @@ def main():
         workspace = Path(temporary)
         configs = {}
         for app in ["todolist", "ledger"]:
-            shutil.copytree(ROOT / "examples" / app / args.backend, workspace / app)
-            configs[app] = configure(workspace, app, args.backend, postgres, args.image)
-        # PG uses one database with both applications' tables. Its aliases share
-        # one migration directory and coordinated ownership, not separate histories.
-        if args.backend == "postgres":
-            for source in (workspace / "ledger/interfaces").iterdir():
-                shutil.copytree(source, workspace / "todolist/interfaces" / source.name)
-            (workspace / "todolist/migrations/0002_entries.sql").write_bytes(
-                (workspace / "ledger/migrations/0001_entries.sql").read_bytes())
-        with server(args.binary, args.image, workspace) as (data, management):
-            deploy(management, "todolist", configs["todolist"])
+            destination = workspace / "databases" / app
             if args.backend == "postgres":
-                # Same explicit combined migration set for aliases of a shared DB;
-                # calls below remain sequential (one migrator).
-                configs["ledger"]["interfaces"] = configs["todolist"]["interfaces"]
-                configs["ledger"]["migrations"] = configs["todolist"]["migrations"]
-            deploy(management, "ledger", configs["ledger"])
+                # Aliases of one PG database must carry the same complete history.
+                # Fixed layout means identical files, not external directory paths.
+                shutil.copytree(ROOT / "examples/todolist/postgres", destination)
+                shutil.copytree(ROOT / "examples/ledger/postgres/interfaces",
+                                destination / "interfaces", dirs_exist_ok=True)
+                shutil.copyfile(ROOT / "examples/ledger/postgres/migrations/0001_entries.sql",
+                                destination / "migrations/0002_entries.sql")
+            else:
+                shutil.copytree(ROOT / "examples" / app / args.backend, destination)
+            configs[app] = configure(args.backend, postgres)
+        with server(args.binary, args.image, workspace) as (data, management):
+            published = {
+                app: deploy(management, app, configs[app])
+                for app in ["todolist", "ledger"]
+            }
             crud(data)
             if args.backend == "turso":
                 recovery(data, management, workspace)
@@ -257,8 +254,8 @@ def main():
                     subprocess.run(["node", str(client), data], check=True, timeout=30)
         with server(args.binary, args.image, workspace) as (data, management):
             for app in ["todolist", "ledger"]:
-                request(management, "GET", f"/databases/{app}", expected=404)
-                deploy(management, app, configs[app])
+                assert request(management, "GET", f"/databases/{app}")["phase"] == "ready"
+                request(management, "GET", f"/databases/{app}/operations/{published[app]}", expected=404)
             assert records(data, "todolist", "GET", "/todos") == [
                 {"id": 41, "title": "Read the contract", "completed": False}]
             assert records(data, "ledger", "GET", "/balance") == [{"balance_minor": -425}]

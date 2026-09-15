@@ -14,6 +14,8 @@ fi
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+# PostgreSQL-dependent library tests belong in postgres_tests modules.
+cargo test --locked --lib postgres_tests:: -- --ignored
 cargo test --locked --test migration_contract postgres_ -- --ignored
 cargo test --locked --test postgres_contract --test execution_contract \
   --test commit_contract --test registry_postgres -- --ignored

@@ -1,50 +1,62 @@
 # Compact SQLRest contract
 
 Management and data are different listeners. Name uses ASCII alphanumeric, `_`
-or `-`. Paths in registration are service-local, including inside containers.
+or `-`. Paths are fixed under `workspace/databases/{name}`.
 
 ```json
 {
-  "database": {"kind": "turso", "path": "/data/todolist.db"},
-  "interfaces": "/config/interfaces",
-  "migrations": "/config/migrations",
-  "limits": {"timeout_ms": 5000, "max_rows": 100}
+  "database": {"kind": "turso"},
+  "limits": {"request_timeout_ms": 5000, "max_rows": 1000},
+  "migration_timeout_ms": 60000
 }
 ```
 
 PostgreSQL target:
 `{"kind":"postgres_unencrypted","connection":"postgresql://user:password@host/database"}`.
-No defaults for omitted fields; unknown/duplicate fields fail. Keep secrets in
-runtime-controlled configs, not frontend assets or generated SDKs.
+First publish requires database config; later omission preserves the saved target.
+Explicit database config fully replaces it. Omitted limits independently use the
+defaults above on each publish, never previous values. Limits must be positive
+integers; null/unknown/duplicate fields fail. Keep credentials out of frontend
+assets and SDKs. SQLRest writes database.toml; Agents must use management calls.
 
 | Management call | Result |
 | --- | --- |
-| PUT `/databases/{name}` with JSON config | 200 status; same config is idempotent |
-| GET `/databases/{name}` | 200 phase, pause reason, current/latest operation |
-| POST `/databases/{name}/migrate` | 202 `{"operation_id":number}` |
-| POST `/databases/{name}/reload` | 202 operation ID |
+| POST `/databases/{name}/publish` with JSON config | 202 `{"operation_id":"publish-<uuid-base36>"}` |
+| GET `/databases` | All database statuses, including startup failures |
+| GET `/databases/{name}` | 200 phase, recovery state, current/latest operation |
 | DELETE `/databases/{name}` | 202 unregister ID; does not delete DB data |
 | GET `/databases/{name}/operations/{id}` | outcome `running`, `succeeded`, `failed` |
 | GET `/databases/{name}/openapi` | published OpenAPI; optional `server_url` query |
 | GET `/databases/{name}/migrations` | `{"migrations":[{"version":1,"filename":"0001_init.sql","source":"...","checksum":"..."}]}` |
 
-Only current/latest operation results are retained. An older ID can return 404.
+Only current/latest operation results are retained in memory. An older ID can
+return 404; all old IDs are unavailable after restart, not proof of failure.
+Unregister IDs use `unregister-<uuid-base36>`. Both suffixes encode full random UUIDs.
 Status may change between reads. Data requests use `/db/{name}/...`.
 All application errors use `{"error":{"code":"...","message":"...", "parameter":"optional"}}`.
 
 ## Files
 
 ```text
-interfaces/
-  todos/
-    post.sql
-    post.response.yaml
-    [id]/
-      patch.sql
-      patch.response.yaml
-migrations/
-  0001_todos.sql
+workspace/databases/todolist/
+  database.toml       # service-owned
+  data.db             # local Turso only
+  interfaces/
+    todos/
+      post.sql
+      post.response.yaml
+      [id]/
+        patch.sql
+        patch.response.yaml
+  migrations/
+    0001_todos.sql
 ```
+
+TOML stores database config, `[state] recovery` (`none`, `migration`, `reload`),
+and effective `[limits]`. No manual pause flag or operation queue exists.
+Restart loads current interfaces only for unblocked registrations; repair and
+publish blocked ones. Registered local files missing at restart are errors,
+never silently recreated. Whole-workspace lock/I/O failure prevents startup.
 
 SQL filename is an explicit lowercase method. No implicit HEAD or OPTIONS.
 Dynamic directory names are `[id]`. Non-root trailing slash is significant.

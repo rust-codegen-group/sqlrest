@@ -309,7 +309,7 @@ fn supported(ty: &Type) -> bool {
 }
 
 #[cfg(test)]
-mod diagnostic_tests {
+mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires SQLREST_TEST_POSTGRES disposable PostgreSQL"]
     async fn real_driver_error_retains_private_diagnostics() {
