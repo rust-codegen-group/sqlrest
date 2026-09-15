@@ -14,7 +14,7 @@ PostgreSQL **18.3** from pinned `postgres:18-alpine` digest
 `sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7`,
 and uses Node **24.15.0**, TypeScript **6.0.3**, and the openapi-nexus **0.2.3**
 release binary. CI and local SDK verification use
-`scripts/download-openapi-nexus.sh` to download and extract the Linux x86_64 musl
+`just download-openapi-nexus DESTINATION` to download and extract the Linux x86_64 musl
 archive. No generator source is cloned or compiled; download or extraction
 errors fail the setup.
 
@@ -83,19 +83,21 @@ opt-in dependencies, **not evidence of passing** when reported ignored.
 
 Provision two disposable PG databases: a core-test database and a separate
 **empty** examples database. The latter is populated by the examples and must be
-new for another run. Then:
+new for another run. Install Just **1.58.0** first (CI installs this version).
+Then:
 
 ```sh
 SQLREST_TOOLS=$(mktemp -d)
-bash scripts/download-openapi-nexus.sh "$SQLREST_TOOLS/openapi-nexus"
+just download-openapi-nexus "$SQLREST_TOOLS/openapi-nexus"
 
 SQLREST_TEST_POSTGRES='postgresql://user:password@host/core_test' \
 SQLREST_EXAMPLES_POSTGRES='postgresql://user:password@host/examples_test' \
 OPENAPI_NEXUS_BIN="$SQLREST_TOOLS/openapi-nexus/openapi-nexus" \
-  bash scripts/check.sh
+  just
 ```
 
-The script requires all inputs and fails on missing dependencies/errors. It runs
+`just --list` lists the available tasks. The default `all` recipe requires all
+inputs and fails on missing dependencies/errors. It runs
 format, Clippy, normal tests, selected PG migration/execution/HTTP tests,
 both-backend SDK HTTP examples, and the recursive SDK compile test. It does not
 delete the databases. Never use production or user-data databases.
@@ -105,9 +107,49 @@ subprocess fixture, and the upstream high-level Turso CPU timeout probe is
 intentionally skipped. The actual SDK-driver deadline path has separate passing
 tests; skipping the old probe does not mean it was repaired.
 
-The CI workflow runs these gates, builds the release artifact, builds the image
-and invokes the container restart tutorial. No remote CI run or release is implied
-by checking in a workflow; local verification and hosted CI are distinct evidence.
+Each group can also run independently without unrelated dependencies:
+
+```sh
+just fmt
+just clippy
+just turso
+SQLREST_TEST_POSTGRES='postgresql://user:password@host/core_test' \
+  just postgres
+```
+
+SDK groups are `sdk-turso`, `sdk-postgres` and `sdk-schema`. All need
+`OPENAPI_NEXUS_BIN` and the SDK tools; only `sdk-postgres` needs
+`SQLREST_EXAMPLES_POSTGRES`, pointing to its own empty database.
+`release` builds the binary; `container` packages an existing release binary and
+runs its lifecycle tests. These two remain separate from the default `all` group.
+
+## Parallel CI
+
+`.github/workflows/ci.yml` orchestrates four reusable workflows:
+
+| Workflow | Parallel jobs | Dependencies |
+| --- | --- | --- |
+| `quality.yml` | Format, Clippy | Rust; native tools/cache only for Clippy |
+| `tests.yml` | Turso/default contracts, PostgreSQL contracts | PostgreSQL service only for its matrix entry |
+| `sdk.yml` | Turso SDK, PostgreSQL SDK, recursive schema | SDK tools; separate empty PostgreSQL service only for PG |
+| `package.yml` | Release binary, then container lifecycle | Container downloads the binary built in the same run |
+
+The four workflows start independently. Database and SDK matrices use
+`fail-fast: false` so a failure does not cancel other diagnostic results.
+Composite actions in `.github/actions/` share Rust/native/cache setup and SDK
+tool installation. Rust comes from `rust-toolchain.toml`; Clippy, tests and release
+use separate cache partitions. SDK jobs share the tests partition.
+The artifact is a candidate until the complete CI run succeeds; it is not a
+published release.
+
+The final `delivery` job always evaluates all four results and passes only when
+all succeeded, including container verification. Use it as the aggregate required
+check; a failed, cancelled or skipped dependency cannot turn it green.
+PR updates cancel obsolete runs. Push builds run only on `main`, avoiding duplicate
+push and pull-request runs for the same feature branch.
+
+No remote CI run or release is implied by checking in a workflow; local validation
+and hosted CI are distinct evidence.
 
 ## Embedding, backups and trust
 
