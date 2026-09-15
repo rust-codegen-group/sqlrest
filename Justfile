@@ -50,6 +50,14 @@ sdk-schema:
 release:
     cargo build --release --locked
 
+# Verify the actual crate archive without uploading anything.
+publish-dry-run:
+    cargo publish --locked --registry crates-io --dry-run
+
+# Upload the current crate to crates.io. Does not create or push Git tags.
+publish:
+    cargo publish --locked --registry crates-io
+
 # Package an existing release binary and exercise its container lifecycle.
 container:
     docker build --tag sqlrest:ci .

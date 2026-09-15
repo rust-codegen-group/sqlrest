@@ -11,8 +11,8 @@ Verified inputs:
 - Node.js 24.15.0 and TypeScript 6.0.3
 
 Download the pinned release binary, not the generator source. The shared CI/local
-script downloads and extracts the Linux x86_64 musl archive. It requires Bash,
-curl, tar and xz. Install TypeScript in a disposable tools directory or
+Justfile recipe downloads and extracts the Linux x86_64 musl archive. It requires
+Just 1.58.0, Bash, curl, tar and xz. Install TypeScript in a disposable tools directory or
 use an existing matching installation; put its `tsc` on PATH.
 
 ```sh

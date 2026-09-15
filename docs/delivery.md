@@ -132,13 +132,14 @@ runs its lifecycle tests. These two remain separate from the default `all` group
 | `quality.yml` | Format, Clippy | Rust; native tools/cache only for Clippy |
 | `tests.yml` | Turso/default contracts, PostgreSQL contracts | PostgreSQL service only for its matrix entry |
 | `sdk.yml` | Turso SDK, PostgreSQL SDK, recursive schema | SDK tools; separate empty PostgreSQL service only for PG |
-| `package.yml` | Release binary, then container lifecycle | Container downloads the binary built in the same run |
+| `package.yml` | Crates.io dry run; release binary, then container lifecycle | Container downloads the binary built in the same run |
 
 The four workflows start independently. Database and SDK matrices use
 `fail-fast: false` so a failure does not cancel other diagnostic results.
 Composite actions in `.github/actions/` share Rust/native/cache setup and SDK
 tool installation. Rust comes from `rust-toolchain.toml`; Clippy, tests and release
-use separate cache partitions. SDK jobs share the tests partition.
+use separate cache partitions. SDK jobs share the tests partition; crate
+verification has its own partition.
 The artifact is a candidate until the complete CI run succeeds; it is not a
 published release.
 
@@ -150,6 +151,39 @@ push and pull-request runs for the same feature branch.
 
 No remote CI run or release is implied by checking in a workflow; local validation
 and hosted CI are distinct evidence.
+
+## Publishing to crates.io
+
+`Cargo.toml` is the version source for the crate, CLI and exported OpenAPI.
+Prepare a release PR updating its version, the root package in `Cargo.lock`
+and `CHANGELOG.md`. Merge only after the complete `delivery` check passes,
+including the crate dry run.
+
+From a clean checkout of that exact release commit, verify the crate archive:
+
+```sh
+just publish-dry-run
+```
+
+This runs Cargo's packaging and build verification without uploading. It is
+separate from the full backend/SDK tests and does not prove crates.io ownership
+or token permissions. Authenticate with `cargo login --registry crates-io` or
+provide `CARGO_REGISTRY_TOKEN` through your secret manager, then:
+
+```sh
+just publish
+```
+
+This uploads the library and binary crate to crates.io. Cargo's clean-tree and
+package-verification checks remain enabled. A published version cannot be
+overwritten; inspect crates.io before retrying an upload with an uncertain result.
+The maintainer creates and pushes the matching `v0.0.1` tag on the same commit.
+Neither recipe creates tags, GitHub Releases or container releases, and CI never
+uploads to crates.io automatically.
+
+After publication, consumers can install the CLI with
+`cargo install sqlrest --version 0.0.1 --locked` or depend on
+`sqlrest = "0.0.1"`. The native build prerequisites above still apply.
 
 ## Embedding, backups and trust
 

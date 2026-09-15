@@ -420,7 +420,7 @@ fn insert_body(schema: &mut Value, path: &[String], leaf: Value) {
 fn build_openapi(endpoints: &[Arc<Endpoint>]) -> Result<Value, SqlrestError> {
     let mut document = json!({
         "openapi": "3.1.0",
-        "info": {"title": "SQLRest", "version": "0.1.0"},
+        "info": {"title": "SQLRest", "version": env!("CARGO_PKG_VERSION")},
         "paths": {},
         "components": {"schemas": {}}
     });
