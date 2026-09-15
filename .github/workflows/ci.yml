@@ -1,57 +1,35 @@
 name: contracts
+
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  quality:
+    uses: ./.github/workflows/quality.yml
+  tests:
+    uses: ./.github/workflows/tests.yml
+  sdk:
+    uses: ./.github/workflows/sdk.yml
+  package:
+    uses: ./.github/workflows/package.yml
+
+  # A stable required check: failed, cancelled or skipped lanes cannot pass.
   delivery:
-    # The artifact must be compatible with the Docker runtime's glibc 2.36.
+    if: ${{ always() }}
+    needs: [quality, tests, sdk, package]
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    services:
-      postgres:
-        image: postgres:18-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
-        env:
-          POSTGRES_PASSWORD: sqlrest
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 24.15.0
-      - name: Install pinned tools
-        run: |
-          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev pkg-config postgresql-client curl xz-utils
-          npm install --prefix "$RUNNER_TEMP/sqlrest-typescript" --ignore-scripts typescript@6.0.3
-          echo "$RUNNER_TEMP/sqlrest-typescript/node_modules/.bin" >> "$GITHUB_PATH"
-      - name: Download pinned openapi-nexus binary
-        run: |
-          bash scripts/download-openapi-nexus.sh "$RUNNER_TEMP/openapi-nexus"
-          echo "OPENAPI_NEXUS_BIN=$RUNNER_TEMP/openapi-nexus/openapi-nexus" >> "$GITHUB_ENV"
-      - name: Create empty example database
+      - name: Require every lane to succeed
         env:
-          PGPASSWORD: sqlrest
-        run: createdb -h 127.0.0.1 -U postgres sqlrest_examples
-      - name: Format, lint, unit, both backends, binary, restart and SDK contracts
-        env:
-          SQLREST_TEST_POSTGRES: postgresql://postgres:sqlrest@127.0.0.1:5432/postgres
-          SQLREST_EXAMPLES_POSTGRES: postgresql://postgres:sqlrest@127.0.0.1:5432/sqlrest_examples
-        run: bash scripts/check.sh
-      - name: Package verified release artifact and run container lifecycle
-        run: |
-          cargo build --release --locked
-          docker build --tag sqlrest:ci .
-          python3 scripts/e2e.py --image sqlrest:ci
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"

@@ -17,7 +17,7 @@ use an existing matching installation; put its `tsc` on PATH.
 
 ```sh
 SQLREST_TOOLS=$(mktemp -d)
-bash scripts/download-openapi-nexus.sh "$SQLREST_TOOLS/openapi-nexus"
+just download-openapi-nexus "$SQLREST_TOOLS/openapi-nexus"
 cargo build --locked
 OPENAPI_NEXUS_BIN="$SQLREST_TOOLS/openapi-nexus/openapi-nexus" \
   python3 scripts/e2e.py --sdk

@@ -1,0 +1,28 @@
+name: Setup Rust
+description: Install pinned Rust and optional native dependencies, then restore the Rust cache.
+inputs:
+  native:
+    description: Install native build dependencies.
+    default: "true"
+  cache-key:
+    description: Cache partition for this workload; empty disables caching.
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+      with:
+        just-version: 1.58.0
+    - name: Install pinned Rust
+      shell: bash
+      run: rustup toolchain install --no-self-update --profile minimal --component rustfmt --component clippy
+    - name: Install native dependencies
+      if: inputs.native == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang libclang-dev pkg-config
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      if: inputs.cache-key != ''
+      with:
+        shared-key: ${{ inputs.cache-key }}

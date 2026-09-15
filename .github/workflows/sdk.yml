@@ -1,0 +1,42 @@
+name: SDK contracts
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk:
+    name: ${{ matrix.contract }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        contract: [turso, postgres, schema]
+    services:
+      postgres:
+        image: ${{ matrix.contract == 'postgres' && 'postgres:18-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7' || '' }}
+        env:
+          POSTGRES_PASSWORD: sqlrest
+          POSTGRES_DB: sqlrest_examples
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: tests
+      - uses: ./.github/actions/setup-sdk
+      - name: Run SDK contract
+        env:
+          SQLREST_EXAMPLES_POSTGRES: postgresql://postgres:sqlrest@127.0.0.1:5432/sqlrest_examples
+          CHECK_GROUP: sdk-${{ matrix.contract }}
+        run: just "$CHECK_GROUP"
