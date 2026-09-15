@@ -45,6 +45,7 @@ fn snapshot_routes_body_and_openapi_are_one_contract() {
         405
     );
     let openapi = snapshot.openapi("/db/personal");
+    assert_eq!(openapi["info"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         openapi["components"]["schemas"]["PatchTodosByIdInput"]["properties"]["input"]["properties"]
             ["completed"]["type"],

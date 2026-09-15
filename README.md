@@ -70,6 +70,7 @@ do not expose the management port to users. No auth, TLS or CORS is installed.
   Includes restart, polling, history repair and checking behavior after publish.
 - [Container and verification](docs/delivery.md): pinned inputs, local image,
   complete test gates and CI.
+- [Changelog](CHANGELOG.md): user-visible changes and release boundaries.
 
 ## Contracts
 
