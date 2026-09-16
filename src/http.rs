@@ -1,4 +1,4 @@
-//! Independent data and management listeners over the shared Registry.
+//! Embeddable data HTTP service and independent data/management listeners.
 use crate::{
     SqlrestError,
     params::Input,
@@ -15,6 +15,68 @@ use serde::Serialize;
 use std::{future::Future, net::SocketAddr};
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+
+/// Data-only HTTP access to a shared Registry, without binding any listeners.
+///
+/// Requests use `/db/{name}/...`. The host owns authentication and authorization
+/// for each database and strips any outer mount prefix before calling `handle`.
+/// Clones share shutdown state; dropping a clone does not shut down the service.
+#[derive(Clone)]
+pub struct DataService {
+    state: ServiceState,
+}
+
+impl DataService {
+    pub fn new(registry: Registry) -> Self {
+        Self {
+            state: ServiceState {
+                registry,
+                stop: CancellationToken::new(),
+            },
+        }
+    }
+
+    /// Handle an HTTP request using the standalone server's complete data contract.
+    pub async fn handle(&self, request: Request) -> Response {
+        data_handler(State(self.state.clone()), request).await
+    }
+
+    /// Mountable router with no management routes or implicit HEAD/OPTIONS.
+    ///
+    /// Mount with `Router::nest_service`, which strips the mount prefix and lets
+    /// the host apply `route_layer` authorization to the mounted service.
+    /// Do not use `Router::nest` with host `route_layer`: this router uses a
+    /// fallback handler, and `route_layer` does not protect nested fallbacks.
+    ///
+    /// ```
+    /// use axum::Router;
+    /// use sqlrest::{http::DataService, registry::Registry};
+    ///
+    /// fn mount(registry: Registry) -> (Router, DataService) {
+    ///     let data = DataService::new(registry);
+    ///     let app = Router::new().nest_service("/api/sql", data.router());
+    ///     // The host must add its authentication/authorization middleware.
+    ///     // Requests now use /api/sql/db/{name}/...
+    ///     (app, data)
+    /// }
+    /// ```
+    pub fn router(&self) -> Router {
+        Router::new()
+            .fallback(data_handler)
+            .with_state(self.state.clone())
+    }
+
+    /// Close admission, cancel incomplete uploads, and await core cleanup.
+    ///
+    /// This shuts down the entire shared Registry, including other services
+    /// using it. Keep Tokio alive until this future completes. The host remains
+    /// responsible for stopping its own listeners.
+    pub async fn shutdown(&self) -> Result<(), SqlrestError> {
+        self.state.registry.start_shutdown()?;
+        self.state.stop.cancel();
+        self.state.registry.shutdown().await
+    }
+}
 
 pub struct Server {
     registry: Registry,
@@ -77,9 +139,10 @@ impl Server {
         };
         // A fallback handler keeps explicit HEAD/OPTIONS and our JSON errors;
         // it does not install implicit GET-to-HEAD or CORS behavior.
-        let data = Router::new()
-            .fallback(data_handler)
-            .with_state(state.clone());
+        let data = DataService {
+            state: state.clone(),
+        }
+        .router();
         let management = Router::new().fallback(management_handler).with_state(state);
         let mut servers = JoinSet::new();
         let data_stop = stop.clone();
