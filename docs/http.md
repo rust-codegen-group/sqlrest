@@ -82,6 +82,51 @@ shutdown cancels incomplete uploads. Other management routes ignore bodies.
 
 ## Embedding and shutdown
 
+To mount data HTTP access inside an existing Axum host without opening either
+SQLRest listener, use `DataService`:
+
+```rust
+use axum::Router;
+use sqlrest::{http::DataService, registry::Registry};
+
+fn mount(registry: Registry) -> (Router, DataService) {
+    let data = DataService::new(registry);
+    let app = Router::new().nest_service("/api/sql", data.router());
+    (app, data)
+}
+```
+
+Requests use `/api/sql/db/{name}/...`; Axum strips `/api/sql` before dispatch.
+The host must apply its login and per-database authorization before forwarding
+requests. No management endpoints are installed. Continue using Registry methods
+for publication and status in the host's trusted code.
+
+Use `nest_service`, not `nest`: SQLRest's router uses a fallback handler, and
+Axum's `route_layer` does not cover nested fallbacks. With `nest_service`, apply
+the host's authorization `route_layer` **after** mounting the service so it
+protects every method under the mount, including unknown paths. The mount alone
+does not authenticate requests. If forwarding through a custom fallback instead,
+use middleware that also covers fallbacks (such as `layer`), not `route_layer`.
+
+For a custom adapter, `data.handle(request).await` accepts an
+`axum::extract::Request` and returns an `axum::response::Response`. Supply the
+URI as `/db/{name}/...`, preserving its encoded path and query; strip only the
+outer mount prefix, without decoding/re-encoding parameters. Both entrypoints
+reuse the standalone server's request parsing, deadlines, error serialization,
+HEAD handling and execution. Host middleware may intentionally impose additional
+limits; use a fallback or all-method forwarding route to preserve SQLRest's
+explicit HEAD/OPTIONS and JSON 404/405 behavior.
+
+Keep a `DataService` clone for lifecycle management. During host shutdown,
+call `data.shutdown().await` while request tasks and Tokio are still running,
+alongside draining the host's own HTTP server. It closes the entire shared
+Registry, cancels incomplete uploads on this service and its clones, and waits
+for core cleanup. It does not stop host listeners. Dropping a clone/router does
+not shut down the Registry. Independently constructed services have independent
+upload-cancellation tokens; prefer clones when mounting the same service more
+than once. OpenAPI remains available through the Registry; use the external
+server URL `/api/sql/db/{name}` when generating it.
+
 Open with `Registry::open(workspace).await` in a live Tokio runtime, or pass it to
 `http::Server::bind` / `from_listeners`. Await `serve(shutdown_future)` to serve
 both listeners. `Registry::shutdown().await` closes global admission and drains

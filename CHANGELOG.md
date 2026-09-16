@@ -4,6 +4,12 @@ User-visible changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- Embed the data-only HTTP API in an existing host with `http::DataService`,
+  using a mountable Axum router or a direct request handler. Reuse SQLRest's
+  parsing, deadlines and errors without binding standalone listeners.
+
 ## 0.0.1 - 2026-09-15
 
 ### Added

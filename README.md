@@ -78,6 +78,10 @@ Read [interfaces](docs/interfaces.md), [execution](docs/execution.md),
 [registry](docs/registry.md), [migrations](docs/migrations.md), and
 [HTTP](docs/http.md) for details. Embedded users call `Registry` from Tokio;
 standalone callers use the same core through HTTP.
+Hosts with an existing HTTP server can mount `http::DataService::router()` with
+Axum's `nest_service` or
+call `DataService::handle()` without binding SQLRest listeners; see
+[HTTP embedding](docs/http.md#embedding-and-shutdown).
 
 Important boundaries:
 
