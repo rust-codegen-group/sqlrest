@@ -4,16 +4,13 @@ User-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.0.1 - 2026-09-16
+
 ### Added
 
 - Embed the data-only HTTP API in an existing host with `http::DataService`,
   using a mountable Axum router or a direct request handler. Reuse SQLRest's
   parsing, deadlines and errors without binding standalone listeners.
-
-## 0.0.1 - 2026-09-15
-
-### Added
-
 - Serve database-backed HTTP APIs from SQL files with explicitly typed parameters
   and validated response schemas. Use SQLRest as a standalone process or embed
   its Rust library. See [Getting started](docs/getting-started.md).
