@@ -124,6 +124,15 @@ pub(crate) struct Workspace {
     pub(crate) remove_fault: std::sync::Mutex<Option<RemoveFault>>,
 }
 
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        // A duplicated or inherited descriptor keeps a flock alive after this
+        // file is closed. Release the logical workspace owner explicitly so
+        // such descriptors cannot outlive the Workspace's ownership.
+        let _ = self._lock.unlock();
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PersistFault {
@@ -514,6 +523,19 @@ mod tests {
         assert!(workspace.directory("app").join("interfaces").is_dir());
         drop(workspace);
         assert!(Workspace::open(temp.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicated_lock_descriptor_does_not_outlive_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path()).unwrap();
+        let duplicate = workspace._lock.try_clone().unwrap();
+        drop(workspace);
+
+        let reopened = Workspace::open(temp.path()).unwrap();
+        drop(duplicate);
+        drop(reopened);
     }
 
     #[cfg(unix)]
