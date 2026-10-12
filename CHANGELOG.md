@@ -4,6 +4,11 @@ User-visible changes are recorded here.
 
 ## Unreleased
 
+### Fixed
+
+- Release the workspace lock when its final owner drops, even if a file
+  descriptor was duplicated or inherited.
+
 ## 0.0.1 - 2026-09-16
 
 ### Added
